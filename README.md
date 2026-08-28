@@ -3,18 +3,6 @@
 A browser-based dashboard for bringing up, testing, and driving the
 6-DOF arm over CAN. 
 
-## What this is built on
-
-This does **not** reimplement your CAN protocol. It reuses the exact
-same `GimMotor` / `Joint` / `can_bus` API that `09_control_gui.py`
-already called (`joint.set_angle()`, `joint.enable()`,
-`motor.read_status()`, etc.) — see `backend/arm_controller.py`. The
-only place raw CAN frames are built by hand here is the broadcast
-**discovery/scan** and the experimental **CAN-address-assign**
-feature, both ported line-for-line from your `can_scanner.py`
-(`CMD_VERSION 0xA0`, `CMD_STATUS 0xAE`, `CMD_SET_ADDR 0xBA`, the
-`0x08` minimum-protocol guard, etc.).
-
 ## Install & run
 
 ```bash
