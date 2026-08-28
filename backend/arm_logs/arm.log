@@ -1,0 +1,3 @@
+2026-08-27 10:46:34,052 [WARNING] Wrist: requested pitch 90.00/roll 180.00 deg exceeds wrist_l/wrist_r travel at this combination -- scaled to pitch 60.00/roll 120.00 deg (direction preserved, magnitude reduced)
+2026-08-27 10:46:34,053 [WARNING] Wrist pitch: requested 120.00 deg clamped to configured limit 90.00 deg
+2026-08-27 10:46:34,054 [WARNING] Wrist pitch: requested 180.00 deg clamped to configured limit 90.00 deg

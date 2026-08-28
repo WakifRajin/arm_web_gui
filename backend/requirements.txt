@@ -1,0 +1,4 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-can>=4.3
+websockets>=12.0

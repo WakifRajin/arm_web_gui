@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Team Interplanetar — Rover Arm Control</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header id="topbar">
+  <div class="brand">
+    <span class="brand-mark">◈</span>
+    <span class="brand-text">
+      <span class="brand-title">TEAM INTERPLANETAR</span>
+      <span class="brand-sub">Rover Arm — CAN Control</span>
+    </span>
+  </div>
+  <div class="conn-status" id="connStatus">
+    <span id="wsDot" class="dot dot-red"></span>
+    <span id="wsText">connecting…</span>
+    <span id="busBanner" class="bus-banner hidden">BUS UNRESPONSIVE</span>
+  </div>
+  <div class="topbar-actions">
+    <button id="btnReconnect" class="btn btn-secondary" title="Reopen the CAN bus and rebuild every joint">Reconnect Bus</button>
+    <button id="btnScan" class="btn btn-secondary" title="Broadcast-scan for motors not yet configured as a joint">Scan for Devices</button>
+    <button id="btnEstop" class="btn btn-estop">EMERGENCY STOP</button>
+  </div>
+</header>
+
+<nav id="tabbar">
+  <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
+  <button class="tab-btn" data-tab="control">Control</button>
+  <button class="tab-btn" data-tab="wrist">Wrist</button>
+  <button class="tab-btn" data-tab="batch">Batch</button>
+  <button class="tab-btn" data-tab="discovery">Discovery</button>
+  <button class="tab-btn" data-tab="canbus">CAN Bus</button>
+  <button class="tab-btn" data-tab="log">Event Log</button>
+</nav>
+
+<main>
+
+  <section id="tab-dashboard" class="tabpanel active">
+    <section class="panel">
+      <h2>Dashboard</h2>
+      <div id="jointGrid" class="joint-grid"></div>
+    </section>
+  </section>
+
+  <section id="tab-control" class="tabpanel">
+    <section class="panel">
+      <div class="panel-head-row">
+        <h2 style="border:none;margin:0;padding:0;">Individual Control</h2>
+        <div class="joint-picker">
+          <label>Joint</label>
+          <select id="jointSelect"></select>
+          <span id="selJointBadge" class="badge badge-dim">torque OFF</span>
+        </div>
+      </div>
+
+      <div class="control-grid">
+        <div class="control-card">
+          <h3>Position</h3>
+          <div class="gauge-wrap">
+            <div class="gauge-track" id="gaugeTrack">
+              <div class="gauge-fill" id="gaugeFill"></div>
+              <div class="gauge-current" id="gaugeCurrent" title="current angle"></div>
+              <div class="gauge-target" id="gaugeTarget" title="target angle"></div>
+            </div>
+            <div class="gauge-labels">
+              <span id="gaugeMin">--</span>
+              <span id="gaugeReadout">-- deg &nbsp;|&nbsp; -- deg/s</span>
+              <span id="gaugeMax">--</span>
+            </div>
+          </div>
+          <div class="field-row">
+            <label>Target angle (deg)</label>
+            <input id="angleInput" type="number" step="0.1" value="0">
+          </div>
+          <input id="angleSlider" type="range" min="-180" max="180" step="0.5" value="0">
+          <div class="field-row">
+            <label class="chk"><input id="rampedToggle" type="checkbox" checked> Ramped move (soft-start/stop)</label>
+          </div>
+          <button id="btnGo" class="btn btn-primary full-width">Go To Angle</button>
+          <div class="btn-pair">
+            <button id="btnEnable" class="btn btn-primary">Enable Torque</button>
+            <button id="btnDisable" class="btn btn-secondary">Disable Torque</button>
+          </div>
+          <button id="btnSetHome" class="btn btn-warning full-width">Set Home / Origin Here</button>
+          <button id="btnClearFault" class="btn btn-secondary full-width">Clear Fault</button>
+        </div>
+
+        <div class="control-card">
+          <h3>Jog</h3>
+          <p class="hint">Hold to move (soft-ramped). Release to stop. Torque must be on.</p>
+          <div class="jog-buttons">
+            <button id="jogNeg" class="btn btn-jog">&#8592; Negative</button>
+            <button id="jogPos" class="btn btn-jog">Positive &#8594;</button>
+          </div>
+        </div>
+
+        <div class="control-card">
+          <h3>Limits &amp; Speed <span class="hint">(saved to config)</span></h3>
+          <div class="field-row"><label>Min angle (deg)</label><input id="limMin" type="number" step="0.1"></div>
+          <div class="field-row"><label>Max angle (deg)</label><input id="limMax" type="number" step="0.1"></div>
+          <div class="field-row"><label>Max speed (RPM)</label><input id="limSpeed" type="number" step="0.5"></div>
+          <div class="field-row"><label>Max accel (RPM/s)</label><input id="limAccel" type="number" step="0.5"></div>
+          <div class="field-row"><label>Max current (A)</label><input id="limCurrent" type="number" step="0.1"></div>
+          <button id="btnSaveLimits" class="btn btn-primary full-width">Save Limits &amp; Speed</button>
+          <p class="hint hint-block">Changes apply immediately if torque is already on — no need to re-enable.</p>
+        </div>
+
+        <div class="control-card">
+          <h3>Direction</h3>
+          <div class="field-row"><label>Motor direction</label>
+            <select id="dirSelect"><option value="1">Normal</option><option value="-1">Reversed</option></select>
+          </div>
+          <button id="btnSaveDirection" class="btn btn-secondary full-width">Reverse Direction</button>
+          <p class="hint hint-block">Torque must be OFF to change this — re-enable afterward so the target re-seeds under the new convention.</p>
+        </div>
+
+        <div class="control-card">
+          <h3>Gains <span class="hint">(position &amp; velocity loop)</span></h3>
+          <p class="hint hint-block">Requires <code>joint.py</code> to implement <code>set_position_gains()</code> / <code>set_velocity_gains()</code> — see README, "Tuning gains". Sending will error clearly in the Event Log if it's not there yet.</p>
+          <div class="gains-group">
+            <span class="gains-group-label">Position loop</span>
+            <div class="field-row"><label>Kp</label><input id="posKp" type="number" step="0.01"></div>
+            <div class="field-row"><label>Ki</label><input id="posKi" type="number" step="0.01"></div>
+          </div>
+          <div class="gains-group">
+            <span class="gains-group-label">Velocity loop</span>
+            <div class="field-row"><label>Kp</label><input id="velKp" type="number" step="0.01"></div>
+            <div class="field-row"><label>Ki</label><input id="velKi" type="number" step="0.01"></div>
+          </div>
+          <button id="btnSaveGains" class="btn btn-primary full-width">Save Gains</button>
+        </div>
+      </div>
+    </section>
+  </section>
+
+  <section id="tab-wrist" class="tabpanel">
+    <section class="panel">
+      <h2>Differential Wrist <span class="hint">(pitch/roll mixed onto two motors)</span></h2>
+      <div class="control-grid">
+        <div class="control-card">
+          <h3>Move</h3>
+          <div class="field-row"><span>Current pitch</span><span id="wristCurPitch" class="mono-val">--</span></div>
+          <div class="field-row"><span>Current roll</span><span id="wristCurRoll" class="mono-val">--</span></div>
+          <div class="field-row"><span>Target pitch</span><span id="wristTgtPitch" class="mono-val">--</span></div>
+          <div class="field-row"><span>Target roll</span><span id="wristTgtRoll" class="mono-val">--</span></div>
+          <div class="field-row"><label>Pitch (deg)</label><input id="wristPitchInput" type="number" step="0.1" value="0"></div>
+          <div class="field-row"><label>Roll (deg)</label><input id="wristRollInput" type="number" step="0.1" value="0"></div>
+          <div class="field-row"><label class="chk"><input id="wristRampedToggle" type="checkbox" checked> Ramped move (soft-start/stop)</label></div>
+          <button id="btnWristGo" class="btn btn-primary full-width">Go To Pitch/Roll</button>
+          <p class="hint hint-block">Both motors must have torque ON. Pitch/roll are clamped to the limits below before mixing. If a legal pitch+roll combination would still ask a motor to travel past its own limit, both targets are scaled back together (direction preserved, magnitude reduced) rather than letting one motor clamp on its own — the Event Log shows the achieved pitch/roll when that happens.</p>
+        </div>
+
+        <div class="control-card">
+          <h3>Mixing Config <span class="hint">(verify on the bench before trusting this)</span></h3>
+          <div class="field-row"><label class="chk"><input id="wristEnabled" type="checkbox"> Differential wrist enabled</label></div>
+          <div class="field-row"><label>Motor A</label><select id="wristMotorA"></select></div>
+          <div class="field-row"><label>Motor B</label><select id="wristMotorB"></select></div>
+          <div class="field-row"><label class="chk"><input id="wristSwapPitchRoll" type="checkbox"> Swap pitch/roll axes</label></div>
+          <div class="field-row"><label>Pitch sign (A)</label><select id="wristPitchSignA"><option value="1">+1</option><option value="-1">-1</option></select></div>
+          <div class="field-row"><label>Roll sign (A)</label><select id="wristRollSignA"><option value="1">+1</option><option value="-1">-1</option></select></div>
+          <div class="field-row"><label>Pitch sign (B)</label><select id="wristPitchSignB"><option value="1">+1</option><option value="-1">-1</option></select></div>
+          <div class="field-row"><label>Roll sign (B)</label><select id="wristRollSignB"><option value="-1">-1</option><option value="1">+1</option></select></div>
+          <div class="field-row"><label>Mix ratio</label><input id="wristMixRatio" type="number" step="0.01" value="1.0"></div>
+          <div class="field-row"><label>Pitch min (deg)</label><input id="wristPitchMin" type="number" step="1" value="-90"></div>
+          <div class="field-row"><label>Pitch max (deg)</label><input id="wristPitchMax" type="number" step="1" value="90"></div>
+          <div class="field-row"><label>Roll min (deg)</label><input id="wristRollMin" type="number" step="1" value="-180"></div>
+          <div class="field-row"><label>Roll max (deg)</label><input id="wristRollMax" type="number" step="1" value="180"></div>
+          <button id="btnWristSaveConfig" class="btn btn-secondary full-width">Save Wrist Config</button>
+          <p class="hint hint-block">Default convention: motor A = pitch + roll, motor B = pitch − roll. With torque OFF or a low speed/current limit, jog pitch a small amount alone (roll = 0) and confirm the wrist tips the way you expect; do the same for roll alone. If pitch and roll are swapped rather than reversed (pitch input moves it like roll), use "Swap pitch/roll axes" instead of a sign flip — a sign only reverses a direction, it can't exchange the two axes.</p>
+        </div>
+      </div>
+    </section>
+  </section>
+
+  <section id="tab-batch" class="tabpanel">
+    <section class="panel">
+      <h2>Batch Configure</h2>
+      <div class="batch-actions" style="margin-top:0;">
+        <button id="batchSelectAll" class="btn btn-secondary">Select All</button>
+        <button id="batchSelectNone" class="btn btn-secondary">Select None</button>
+      </div>
+      <table id="batchTable" class="batch-table">
+        <thead><tr><th></th><th>Joint</th><th>Target angle (deg)</th></tr></thead>
+        <tbody id="batchTableBody"></tbody>
+      </table>
+      <div class="batch-actions">
+        <button id="batchEnable" class="btn btn-primary">Enable Selected</button>
+        <button id="batchDisable" class="btn btn-secondary">Disable Selected</button>
+        <button id="batchClearFault" class="btn btn-secondary">Clear Faults</button>
+        <button id="batchSetHome" class="btn btn-warning">Set Home Selected</button>
+      </div>
+      <div class="batch-goto">
+        <label>Fill checked rows with (deg):</label>
+        <input id="batchAngle" type="number" step="0.1" value="0">
+        <button id="batchFill" class="btn btn-secondary">Fill</button>
+        <button id="batchGo" class="btn btn-primary">Go To Angles</button>
+      </div>
+      <p class="hint hint-block">Check the joints to move, set each one's own target angle in the table (or type one value above and hit "Fill" to copy it into every checked row), then "Go To Angles" moves them all at once, each to its own angle. Joints without torque enabled are skipped automatically — a note appears in the Event Log. "Set Home Selected" is a permanent write per motor, same as Set Home on the Control tab — you'll get one confirmation listing every joint before anything is sent.</p>
+    </section>
+  </section>
+
+  <section id="tab-discovery" class="tabpanel">
+    <section class="panel">
+      <h2>Auto-Detected Devices <span class="hint">(responding on the bus but not yet a configured joint)</span></h2>
+      <table id="discoveryTable">
+        <thead><tr><th>Address</th><th>Protocol</th><th>App FW</th><th>Last seen</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p id="discoveryEmpty" class="hint hint-block">No unclaimed devices seen yet — periodic scan runs automatically.</p>
+      <div id="addJointForm" class="add-joint-form hidden">
+        <h3>Add as joint</h3>
+        <input id="newJointAddr" type="hidden">
+        <div class="field-row"><label>Name</label><input id="newJointName" type="text" placeholder="e.g. gripper"></div>
+        <div class="field-row"><label>Direction</label>
+          <select id="newJointDir"><option value="1">1 (normal)</option><option value="-1">-1 (reversed)</option></select>
+        </div>
+        <div class="field-row"><label>Min / Max deg</label>
+          <input id="newJointMin" type="number" value="-90" style="width:70px">
+          <input id="newJointMax" type="number" value="90" style="width:70px">
+        </div>
+        <div class="field-row"><label>Max speed (RPM) / accel (RPM/s)</label>
+          <input id="newJointSpeed" type="number" value="15" style="width:70px">
+          <input id="newJointAccel" type="number" value="30" style="width:70px">
+        </div>
+        <div class="field-row"><label>Max current (A)</label><input id="newJointCurrent" type="number" value="2.3" style="width:70px"></div>
+        <button id="btnAddJoint" class="btn btn-primary">Add Joint</button>
+        <button id="btnCancelAddJoint" class="btn btn-secondary">Cancel</button>
+      </div>
+    </section>
+  </section>
+
+  <section id="tab-canbus" class="tabpanel">
+    <section class="panel">
+      <h2>CAN Bus Failsafes &amp; Diagnostics</h2>
+      <div class="control-grid">
+        <div class="control-card">
+          <h3>Interface</h3>
+          <div class="field-row"><span>Name</span><span id="canIfaceName" class="mono-val">--</span></div>
+          <div class="field-row"><span>Configured bitrate</span><span id="canBitrate" class="mono-val">--</span></div>
+          <div class="field-row"><span>Link state</span><span id="canState" class="mono-val">--</span></div>
+          <div class="field-row"><span>Bus-off</span><span id="canBusOff" class="mono-val">--</span></div>
+          <div class="field-row"><span>Error-passive</span><span id="canErrPassive" class="mono-val">--</span></div>
+          <div class="field-row"><span>RX / TX errors</span><span id="canErrCounts" class="mono-val">-- / --</span></div>
+          <button id="btnCanRefresh" class="btn btn-secondary full-width">Refresh Status</button>
+        </div>
+        <div class="control-card">
+          <h3>Failsafe controls</h3>
+          <p class="hint hint-block">Bring-up reopens the OS-level SocketCAN link (and reconnects the backend to it). Bring-down is a hard kill one level below E-STOP — it E-STOPs first, then cuts CAN traffic at the OS level entirely, useful if a motor won't stop responding to disable frames.</p>
+          <button id="btnCanUp" class="btn btn-primary full-width">Bring CAN Up</button>
+          <button id="btnCanDown" class="btn btn-estop full-width" style="margin-top:8px;">Bring CAN Down</button>
+        </div>
+        <div class="control-card control-card-wide">
+          <h3>Candump snapshot</h3>
+          <p class="hint hint-block">Captures raw frames straight off the bus for a few seconds — useful for confirming traffic exists at all, independent of this GUI's own polling.</p>
+          <div class="field-row">
+            <label>Duration</label>
+            <select id="candumpDuration">
+              <option value="1">1 s</option>
+              <option value="2" selected>2 s</option>
+              <option value="5">5 s</option>
+            </select>
+            <button id="btnCandump" class="btn btn-primary">Capture</button>
+          </div>
+          <pre id="candumpOutput" class="candump-output">No capture yet.</pre>
+        </div>
+      </div>
+    </section>
+  </section>
+
+  <section id="tab-log" class="tabpanel">
+    <section class="panel">
+      <h2>Event Log</h2>
+      <div class="log-controls">
+        <label>Min level:</label>
+        <select id="logLevelFilter">
+          <option value="DEBUG">Debug</option>
+          <option value="INFO" selected>Info</option>
+          <option value="WARNING">Warning</option>
+          <option value="ERROR">Error</option>
+        </select>
+        <label>Joint:</label>
+        <select id="logJointFilter"><option value="">All</option></select>
+        <button id="btnClearLogView" class="btn btn-secondary">Clear View</button>
+      </div>
+      <div id="logView" class="log-view"></div>
+    </section>
+  </section>
+
+</main>
+
+<div id="toastStack" class="toast-stack"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
