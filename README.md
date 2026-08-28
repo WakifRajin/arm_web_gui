@@ -20,7 +20,6 @@ feature, both ported line-for-line from your `can_scanner.py`
 ```bash
 cd backend
 pip install -r requirements.txt
-# copy in gim_motor.py, joint.py, can_bus.py first (see above)
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
