@@ -1,10 +1,7 @@
-# Rover Arm Web GUI — Team Interplanetar (BUET Mars Rover Team)
+# Rover Arm Web GUI
 
 A browser-based dashboard for bringing up, testing, and driving the
-6-DOF arm over CAN. Replaces `09_control_gui.py` (Tkinter) with a
-FastAPI backend + a plain-JS frontend, so anyone on the team's network
-can pull it up in a browser instead of needing a desktop session on
-the bench laptop.
+6-DOF arm over CAN. 
 
 ## What this is built on
 
@@ -17,48 +14,6 @@ only place raw CAN frames are built by hand here is the broadcast
 feature, both ported line-for-line from your `can_scanner.py`
 (`CMD_VERSION 0xA0`, `CMD_STATUS 0xAE`, `CMD_SET_ADDR 0xBA`, the
 `0x08` minimum-protocol guard, etc.).
-
-## Required before first run — drop in your driver files
-
-Copy these three files from your existing `scripts/` package into
-`backend/`, next to `arm_controller.py`:
-
-```
-backend/gim_motor.py   <- your low-level CAN protocol driver
-backend/joint.py       <- your degree-based Joint class
-backend/can_bus.py     <- your CAN adapter connection settings
-```
-
-The backend will fail to import without them — that's intentional,
-so nobody accidentally runs against a re-guessed protocol instead of
-your calibrated one.
-
-If you also want to point this at `joint_calibration.json` (Phase 3's
-output), that's whatever your existing `joint.py` already does with
-it — nothing here needs to know about it directly.
-
-### Tuning gains (optional — only if you want the Gains panel live)
-
-The GUI now has a Kp/Ki panel per joint (position loop and velocity
-loop, four fields total). Same drop-in philosophy as everything
-else here: nobody has guessed at your motor's gain registers. To
-make it actually write to the motor, add two methods to your
-`joint.py`'s `Joint` class:
-
-```python
-def set_position_gains(self, kp: float, ki: float):
-    ...  # write the position-loop Kp/Ki over CAN
-
-def set_velocity_gains(self, kp: float, ki: float):
-    ...  # write the velocity-loop Kp/Ki over CAN
-```
-
-Until you add these, clicking "Save Gains" fails loudly with a clear
-message in the Event Log telling you exactly that — it will never
-silently no-op or send made-up protocol bytes. Once saved, gains are
-also persisted in `gui_joints.json` per joint (`pos_kp`, `pos_ki`,
-`vel_kp`, `vel_ki`) purely for display; the GUI doesn't read them
-back from the motor.
 
 ## Install & run
 
@@ -177,7 +132,7 @@ the Worker for the bus. Requires:
   command first and fall back to a non-interactive `sudo -n`, so
   option 1 or 2 need nothing extra.
 
-## Extending to the wheels (`test_gui.py`'s rig)
+## Extending to the wheels
 
 The wheel motors (GIM6010-36 / GIM8108-9, no encoder, velocity-only)
 use a different command set (`0xC1` velocity, `0xB5` ramp, `0xB3` max
