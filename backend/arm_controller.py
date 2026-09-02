@@ -387,6 +387,34 @@ class ArmController:
             raise ValueError("pitch_min_deg must be < pitch_max_deg")
         if roll_min_deg >= roll_max_deg:
             raise ValueError("roll_min_deg must be < roll_max_deg")
+
+        # A 1:1-style differential mix maps EVERY corner of the requested
+        # (pitch, roll) rectangle onto each motor -- not just the extremes
+        # of pitch and roll individually. E.g. with deg_a = pitch + roll,
+        # reaching max pitch AND max roll at once demands
+        # deg_a = pitch_max + roll_max on that single motor, which is
+        # bigger than either limit alone. If the motor's own min/max_deg
+        # is narrower than that, some corner of the pitch/roll rectangle
+        # is physically unreachable and every request near it will get
+        # silently clamped/scaled by wrist_mix(). Warn about this up
+        # front so it shows up as a config problem, not a mystery "why
+        # won't it go past 180" bug during teleop.
+        for pitch_corner in (pitch_min_deg, pitch_max_deg):
+            for roll_corner in (roll_min_deg, roll_max_deg):
+                eff_p, eff_r = (roll_corner, pitch_corner) if swap_pitch_roll else (pitch_corner, roll_corner)
+                deg_a = mix_ratio * (pitch_sign_a * eff_p + roll_sign_a * eff_r)
+                deg_b = mix_ratio * (pitch_sign_b * eff_p + roll_sign_b * eff_r)
+                for name, deg in ((motor_a, deg_a), (motor_b, deg_b)):
+                    j = self.joints[name]
+                    if deg > j.max_deg or deg < j.min_deg:
+                        log_event("warning",
+                                   f"Wrist config: pitch={pitch_corner:.1f}/roll={roll_corner:.1f} deg "
+                                   f"requires {name} to reach {deg:.1f} deg, outside its configured "
+                                   f"[{j.min_deg:.1f}, {j.max_deg:.1f}] travel -- that corner of the "
+                                   f"pitch/roll rectangle is unreachable and wrist_mix() will scale it "
+                                   f"down. Widen {name}'s min_deg/max_deg (if the motor can actually "
+                                   f"travel that far) or narrow pitch/roll limits to match reality.")
+
         self.config["wrist_diff"] = {
             "enabled": enabled, "motor_a": motor_a, "motor_b": motor_b,
             "pitch_sign_a": pitch_sign_a, "roll_sign_a": roll_sign_a,

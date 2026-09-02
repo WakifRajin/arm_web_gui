@@ -15,10 +15,10 @@
     "roll_sign_b": -1,
     "mix_ratio": 1,
     "swap_pitch_roll": true,
-    "pitch_min_deg": -180,
-    "pitch_max_deg": 180,
-    "roll_min_deg": -180,
-    "roll_max_deg": 180
+    "pitch_min_deg": -95.0,
+    "pitch_max_deg": 95.0,
+    "roll_min_deg": -180.0,
+    "roll_max_deg": 180.0
   },
   "joints": [
     {
@@ -67,8 +67,8 @@
       "name": "wrist_l",
       "addr": 12,
       "direction": 1,
-      "min_deg": -180,
-      "max_deg": 180,
+      "min_deg": -280.0,
+      "max_deg": 280.0,
       "max_speed_rpm": 15,
       "max_accel_rpm_s": 30,
       "max_current_a": 2.3,
@@ -81,8 +81,8 @@
       "name": "wrist_r",
       "addr": 13,
       "direction": 1,
-      "min_deg": -180,
-      "max_deg": 180,
+      "min_deg": -280.0,
+      "max_deg": 280.0,
       "max_speed_rpm": 5,
       "max_accel_rpm_s": 10,
       "max_current_a": 2.3,
