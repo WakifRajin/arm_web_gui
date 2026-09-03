@@ -115,6 +115,17 @@ the Worker for the bus. Requires:
   command first and fall back to a non-interactive `sudo -n`, so
   option 1 or 2 need nothing extra.
 
+## Extending to the wheels (`test_gui.py`'s rig)
+
+The wheel motors (GIM6010-36 / GIM8108-9, no encoder, velocity-only)
+use a different command set (`0xC1` velocity, `0xB5` ramp, `0xB3` max
+current, `0xCF` E-STOP, `0xAF` clear fault — all in `test_gui.py`).
+This GUI's architecture (Worker thread owning the bus, ramp-per-axis,
+websocket status fan-out) would extend cleanly to a second
+`DriveController` alongside `ArmController` if/when you want the
+wheels in the same browser dashboard — say the word and that's a
+follow-up, not a rewrite.
+
 ## Project layout
 
 ```
