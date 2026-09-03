@@ -11,7 +11,40 @@ const state = {
   discovered: [],
   selectedJoint: null,
   jointOrder: [],
+  wristPitchActual: null,
+  wristRollActual: null,
+  gamepad: { index: null, enabled: false, prevButtons: [] },
+  vizView: "front",  // cockpit Arm Position view: front | top | wrist
+  sim: {
+    enabled: false,
+    initialized: false,
+    angles: { base: 0, shoulder: 0, elbow: 0, gripper: 0 },
+    wristPitch: 0,
+    wristRoll: 0,
+  },
+  simPrevButtons: [],
+  gamepadBindings: null,   // populated by loadGamepadBindings() below
+  listeningFor: null,      // action id currently being captured in Settings
+  listenBaseline: null,
+  listenBtnEl: null,
+  listenStarted: 0,
 };
+
+// Standard joint names from gui_joints.default.json -- the Cockpit tab
+// (visualization, quick controls, gamepad mapping) is written against
+// these. Everything checks hasJoint() first, so renaming/removing a
+// joint via the Discovery tab degrades gracefully instead of throwing.
+const JOINT_BASE = "base", JOINT_SHOULDER = "shoulder", JOINT_ELBOW = "elbow",
+      JOINT_WRIST_L = "wrist_l", JOINT_WRIST_R = "wrist_r", JOINT_GRIPPER = "gripper";
+function hasJoint(name) { return !!(state.config && state.config.joints.some(j => j.name === name)); }
+function getJointCfg(name) {
+  return (state.config && state.config.joints.find(j => j.name === name)) || { min_deg: -90, max_deg: 90 };
+}
+function normRange(val, lo, hi, outLo, outHi) {
+  if (val == null || lo == null || hi == null || hi === lo) return (outLo + outHi) / 2;
+  const t = Math.max(0, Math.min(1, (val - lo) / (hi - lo)));
+  return outLo + t * (outHi - outLo);
+}
 
 // Customizable jog step, ported from diff_wrist.py's JOG_STEPS_DEG /
 // bracket-key cycling -- the old jog was a single fixed-speed hold with
@@ -50,6 +83,8 @@ function switchTab(name) {
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tabpanel").forEach(p => p.classList.toggle("active", p.id === `tab-${name}`));
   if (name === "canbus") refreshCanStatus();
+  if (name === "simulation") renderSimViz();
+  if (name !== "settings" && state.listeningFor) cancelListening();
 }
 
 // ---------------------------------------------------------------- WS ----
@@ -84,6 +119,11 @@ function handleMessage(msg) {
       state.jointOrder = msg.config.joints.map(j => j.name);
       buildStaticJointUI();
       populateWristConfigUI();
+      buildCockpitGrid();
+      buildGamepadLegend();
+      renderArmViz();
+      initSimDefaults();
+      renderSimViz();
       $("canIfaceName").textContent = msg.config.can_interface || "can0";
       $("canBitrate").textContent = msg.config.can_bitrate ? `${msg.config.can_bitrate} bps` : "--";
       break;
@@ -92,6 +132,9 @@ function handleMessage(msg) {
       renderJointCard(msg);
       if (msg.name === state.selectedJoint) renderControlPanel(msg);
       updateBusBanner();
+      updateCockpitCard(msg);
+      updateWizardState();
+      maybeRenderViz();
       break;
     case "discovered":
       state.discovered = msg.devices;
@@ -180,6 +223,712 @@ function buildStaticJointUI() {
   if (!state.selectedJoint && state.config.joints.length) {
     selectJoint(state.config.joints[0].name);
   }
+}
+
+function buildCockpitGrid() {
+  const grid = $("cockpitJointGrid");
+  if (!grid || !state.config) return;
+  grid.innerHTML = "";
+  for (const j of state.config.joints) {
+    const card = document.createElement("div");
+    card.className = "cc-card";
+    card.id = `cc-${j.name}`;
+    card.innerHTML = `
+      <div class="cc-head">
+        <span class="dot dot-red" id="cc-dot-${j.name}"></span>
+        <span class="cc-name">${j.name}</span>
+        <span class="cc-angle" id="cc-angle-${j.name}">--°</span>
+      </div>
+      <div class="cc-torque-row">
+        <button class="btn btn-primary cc-torque-btn" id="cc-torque-${j.name}">Enable</button>
+      </div>
+      <div class="jog-buttons">
+        <button class="btn btn-jog" id="cc-jogneg-${j.name}" title="Hold to jog">&minus;</button>
+        <button class="btn btn-jog" id="cc-jogpos-${j.name}" title="Hold to jog">+</button>
+      </div>
+    `;
+    grid.appendChild(card);
+    bindJogGeneric(`cc-jogneg-${j.name}`, j.name, -1);
+    bindJogGeneric(`cc-jogpos-${j.name}`, j.name, 1);
+    $(`cc-torque-${j.name}`).addEventListener("click", () => toggleJointTorque(j.name));
+  }
+}
+
+function bindJogGeneric(btnId, jointName, direction) {
+  const btn = $(btnId);
+  if (!btn) return;
+  const start = () => send({ type: "jog_start", joint: jointName, direction });
+  const stop = () => send({ type: "jog_stop", joint: jointName });
+  btn.addEventListener("mousedown", start);
+  btn.addEventListener("touchstart", (e) => { e.preventDefault(); start(); });
+  ["mouseup", "mouseleave", "touchend", "touchcancel"].forEach(evt => btn.addEventListener(evt, stop));
+}
+
+function toggleJointTorque(name) {
+  if (!hasJoint(name)) return;
+  const s = state.joints[name];
+  send({ type: s && s.enabled ? "disable" : "enable", joint: name });
+}
+
+function updateCockpitCard(s) {
+  const dot = $(`cc-dot-${s.name}`);
+  if (dot) dot.className = "dot " + (s.connected ? "dot-green" : "dot-red");
+  const angle = $(`cc-angle-${s.name}`);
+  if (angle) angle.textContent = s.connected ? `${s.angle.toFixed(1)}°` : "--°";
+  const torqueBtn = $(`cc-torque-${s.name}`);
+  if (torqueBtn) {
+    torqueBtn.textContent = s.enabled ? "Disable" : "Enable";
+    torqueBtn.className = "btn cc-torque-btn " + (s.enabled ? "btn-secondary" : "btn-primary");
+  }
+}
+
+// ----------------------------------------------------------- wizard ----
+function updateWizardState() {
+  if (!state.config || !state.config.joints.length) return;
+  const names = state.config.joints.map(j => j.name);
+  const allConnected = names.every(n => state.joints[n] && state.joints[n].connected);
+  const anyConnected = names.some(n => state.joints[n] && state.joints[n].connected);
+  const allEnabled = names.every(n => state.joints[n] && state.joints[n].enabled);
+
+  $("wizConnText").textContent = allConnected
+    ? `All ${names.length} joints responding.`
+    : anyConnected
+      ? `Some joints responding -- check wiring/power for the rest.`
+      : `Waiting for motors to respond…`;
+  $("wizStep1").classList.toggle("wizard-step-done", allConnected);
+
+  if (allEnabled) {
+    $("wizardBody").classList.add("hidden");
+    $("wizardCollapsed").classList.remove("hidden");
+  } else {
+    $("wizardBody").classList.remove("hidden");
+    $("wizardCollapsed").classList.add("hidden");
+  }
+}
+
+$("btnWizHome").addEventListener("click", () => {
+  if (!state.config) return;
+  const names = state.config.joints.map(j => j.name);
+  if (!confirm(`Set HOME here for ALL ${names.length} joints: ${names.join(", ")}?\n\nEach joint should be OFF torque and physically at its intended zero pose. This is a PERMANENT write to each motor.`)) return;
+  send({ type: "set_home_batch", joints: names });
+  showToast("Home position set for all joints.", "success");
+});
+$("btnWizSkipHome").addEventListener("click", () => {
+  showToast("Skipped homing -- using each motor's last stored zero.", "info");
+});
+$("btnWizEnable").addEventListener("click", () => {
+  if (!state.config) return;
+  const names = state.config.joints.map(j => j.name);
+  send({ type: "enable_batch", joints: names });
+  showToast("Enabling torque on all joints…", "info");
+});
+$("btnWizardToggle").addEventListener("click", () => {
+  $("wizardBody").classList.toggle("hidden");
+});
+$("btnWizardReopen").addEventListener("click", () => {
+  $("wizardBody").classList.remove("hidden");
+  $("wizardCollapsed").classList.add("hidden");
+});
+
+// ------------------------------------------------------ arm visualization --
+// Schematic, not a literal kinematic replica: each link's on-screen angle
+// is the joint's live angle normalized into its own configured min/max
+// range, mapped to a fixed on-screen sweep. That keeps the picture legible
+// regardless of a joint's real (and possibly asymmetric, e.g. 0..165 deg)
+// travel, and needs no hardware-verified sign convention to be useful --
+// it's there so an operator can tell "mostly folded" from "reaching out",
+// not to reproduce true arm geometry.
+const VIZ = { upper: 66, fore: 74, wrist: 22, grip: 20, originX: 110, originY: 210 };
+
+function polarPt(origin, angleDeg, length) {
+  const rad = (angleDeg - 90) * Math.PI / 180;
+  return { x: origin.x + length * Math.cos(rad), y: origin.y + length * Math.sin(rad) };
+}
+
+let lastVizRender = 0;
+function maybeRenderViz() {
+  const now = performance.now();
+  if (now - lastVizRender < 60) return;
+  lastVizRender = now;
+  renderArmViz();
+}
+
+// computeArmPose() turns either live joint telemetry or the local
+// simulation state into the same normalized-angle "pose" shape that all
+// three views draw from. Angles are normalized into each joint's own
+// configured min/max (see VIZ comment above) -- true for both live and
+// simulated poses, since the sim is clamped to the same joint configs.
+function computeArmPose(useSim) {
+  const shCfg = getJointCfg(JOINT_SHOULDER), elCfg = getJointCfg(JOINT_ELBOW), gripCfg = getJointCfg(JOINT_GRIPPER);
+  const wd = (state.config && state.config.wrist_diff) || {};
+  const pitchMin = wd.pitch_min_deg ?? -90, pitchMax = wd.pitch_max_deg ?? 90;
+
+  let shRaw, elRaw, baseRaw, gripRaw, wristPRaw, wristRRaw, stale, wristKnown;
+
+  if (useSim) {
+    shRaw = state.sim.angles.shoulder;
+    elRaw = state.sim.angles.elbow;
+    baseRaw = state.sim.angles.base;
+    gripRaw = state.sim.angles.gripper;
+    wristPRaw = state.sim.wristPitch;
+    wristRRaw = state.sim.wristRoll;
+    wristKnown = true;
+    stale = false;
+  } else {
+    const sh = state.joints[JOINT_SHOULDER], el = state.joints[JOINT_ELBOW];
+    const base = state.joints[JOINT_BASE], grip = state.joints[JOINT_GRIPPER];
+    shRaw = (sh && sh.connected) ? sh.angle : null;
+    elRaw = (el && el.connected) ? el.angle : null;
+    baseRaw = (base && base.connected) ? base.angle : null;
+    gripRaw = (grip && grip.connected) ? grip.angle : null;
+    wristKnown = !!(wd.enabled && state.wristPitchActual != null);
+    wristPRaw = wristKnown ? state.wristPitchActual : null;
+    wristRRaw = (wd.enabled && state.wristRollActual != null) ? state.wristRollActual : null;
+    stale = !(sh && sh.connected && el && el.connected);
+  }
+
+  const shAngle = shRaw != null ? normRange(shRaw, shCfg.min_deg, shCfg.max_deg, -75, 75) : 0;
+  const elAngle = elRaw != null ? normRange(elRaw, elCfg.min_deg, elCfg.max_deg, -75, 75) : 0;
+  const wristPitchAngle = wristPRaw != null ? normRange(wristPRaw, pitchMin, pitchMax, -60, 60) : 0;
+  const gripFrac = (gripRaw != null && gripCfg.max_deg !== gripCfg.min_deg)
+    ? Math.max(0, Math.min(1, (gripRaw - gripCfg.min_deg) / (gripCfg.max_deg - gripCfg.min_deg))) : 0;
+
+  return {
+    shAngle, elAngle, wristPitchAngle, gripFrac, stale, wristKnown,
+    baseRollDeg: baseRaw, wristRollDeg: wristRRaw,
+    baseRaw, shRaw, elRaw, gripRaw, wristPRaw, wristRRaw,
+  };
+}
+
+function renderArmViz() {
+  const svg = $("armSvg");
+  if (!svg || !state.config) return;
+  const pose = computeArmPose(false);
+  drawView(svg, pose, state.vizView || "front");
+  writeReadouts("viz", pose);
+}
+
+function renderSimViz() {
+  const front = $("simSvgFront"), top = $("simSvgTop"), wrist = $("simSvgWrist");
+  if (!front || !state.config) return;
+  const pose = computeArmPose(true);
+  drawView(front, pose, "front");
+  drawView(top, pose, "top");
+  drawView(wrist, pose, "wrist");
+  writeReadouts("sim", pose);
+}
+
+function writeReadouts(prefix, pose) {
+  const grip = $(`${prefix}GripReadout`);
+  const gripKnown = pose.gripRaw != null || prefix === "sim";
+  $(`${prefix}BaseReadout`).textContent = pose.baseRaw != null ? `${pose.baseRaw.toFixed(1)}°` : "--";
+  $(`${prefix}ShoulderReadout`).textContent = pose.shRaw != null ? `${pose.shRaw.toFixed(1)}°` : "--";
+  $(`${prefix}ElbowReadout`).textContent = pose.elRaw != null ? `${pose.elRaw.toFixed(1)}°` : "--";
+  $(`${prefix}WristPReadout`).textContent = pose.wristKnown && pose.wristPRaw != null ? `${pose.wristPRaw.toFixed(1)}°` : (prefix === "sim" ? `${pose.wristPRaw.toFixed(1)}°` : "n/a");
+  $(`${prefix}WristRReadout`).textContent = pose.wristKnown && pose.wristRRaw != null ? `${pose.wristRRaw.toFixed(1)}°` : (prefix === "sim" ? `${pose.wristRRaw.toFixed(1)}°` : "n/a");
+  if (grip) grip.textContent = gripKnown ? `${Math.round(pose.gripFrac * 100)}% open` : "--";
+}
+
+function drawView(svgEl, pose, view) {
+  if (view === "top") drawTopView(svgEl, pose);
+  else if (view === "wrist") drawWristView(svgEl, pose);
+  else drawFrontView(svgEl, pose);
+}
+
+// Front elevation -- the original single view. Shoulder/elbow/wrist-pitch
+// unfold as a 2D chain; base roll only spins the turret icon (it isn't
+// meant to reposition the chain -- see VIZ comment); wrist roll spins the
+// gripper jaws in place.
+function drawFrontView(svgEl, pose) {
+  const { shAngle, elAngle, wristPitchAngle, gripFrac, stale } = pose;
+  const baseRollDeg = pose.baseRollDeg, wristRollDeg = pose.wristRollDeg;
+  const origin = { x: VIZ.originX, y: VIZ.originY };
+  let cum = shAngle;
+  const p1 = polarPt(origin, cum, VIZ.upper);
+  cum += elAngle;
+  const p2 = polarPt(p1, cum, VIZ.fore);
+  cum += wristPitchAngle;
+  const p3 = polarPt(p2, cum, VIZ.wrist);
+  const jawSpread = 8 + gripFrac * 22;
+  const jawTipL = polarPt(p3, cum - jawSpread, VIZ.grip);
+  const jawTipR = polarPt(p3, cum + jawSpread, VIZ.grip);
+
+  const turretRotate = baseRollDeg != null ? baseRollDeg : 0;
+  const rollRotate = wristRollDeg != null ? wristRollDeg : 0;
+
+  svgEl.setAttribute("viewBox", "0 0 260 240");
+  svgEl.innerHTML = `
+    <g class="${stale ? "viz-stale" : ""}">
+      <ellipse cx="${origin.x}" cy="${origin.y + 6}" rx="30" ry="9" class="viz-base-shadow"/>
+      <g transform="rotate(${turretRotate} ${origin.x} ${origin.y})">
+        <rect x="${origin.x - 22}" y="${origin.y - 6}" width="44" height="12" rx="4" class="viz-turret"/>
+        <line x1="${origin.x}" y1="${origin.y}" x2="${origin.x}" y2="${origin.y - 18}" class="viz-turret-mark"/>
+      </g>
+      <circle cx="${origin.x}" cy="${origin.y}" r="7" class="viz-pivot"/>
+      <line x1="${origin.x}" y1="${origin.y}" x2="${p1.x}" y2="${p1.y}" class="viz-link"/>
+      <circle cx="${p1.x}" cy="${p1.y}" r="6" class="viz-pivot"/>
+      <line x1="${p1.x}" y1="${p1.y}" x2="${p2.x}" y2="${p2.y}" class="viz-link"/>
+      <circle cx="${p2.x}" cy="${p2.y}" r="5" class="viz-pivot"/>
+      <line x1="${p2.x}" y1="${p2.y}" x2="${p3.x}" y2="${p3.y}" class="viz-link viz-link-wrist"/>
+      <g transform="rotate(${rollRotate} ${p3.x} ${p3.y})">
+        <line x1="${p3.x}" y1="${p3.y}" x2="${jawTipL.x}" y2="${jawTipL.y}" class="viz-jaw"/>
+        <line x1="${p3.x}" y1="${p3.y}" x2="${jawTipR.x}" y2="${jawTipR.y}" class="viz-jaw"/>
+      </g>
+      <circle cx="${p3.x}" cy="${p3.y}" r="4" class="viz-pivot"/>
+    </g>
+  `;
+}
+
+// Top (bird's-eye) view -- makes base rotation directly legible (the
+// front view only spins a small turret icon) and shows the gripper spread
+// + roll from above. "Reach" is a schematic fold indicator, not a true
+// projected length -- same "proportional, not literal" approach as the
+// front view.
+function drawTopView(svgEl, pose) {
+  const { shAngle, elAngle, gripFrac, stale } = pose;
+  const baseRollDeg = pose.baseRollDeg, wristRollDeg = pose.wristRollDeg;
+  const cx = 130, cy = 130;
+  const heading = baseRollDeg != null ? baseRollDeg : 0;
+  const foldAmount = Math.min(1, (Math.abs(shAngle) + Math.abs(elAngle)) / 150);
+  const reach = 34 + (1 - foldAmount) * 74;
+  const origin = { x: cx, y: cy };
+  const tip = polarPt(origin, heading, reach);
+  const jawSpread = 8 + gripFrac * 22;
+  const rollRotate = wristRollDeg != null ? wristRollDeg : 0;
+  const jawTipL = polarPt(tip, heading - jawSpread, VIZ.grip);
+  const jawTipR = polarPt(tip, heading + jawSpread, VIZ.grip);
+
+  svgEl.setAttribute("viewBox", "0 0 260 260");
+  svgEl.innerHTML = `
+    <g class="${stale ? "viz-stale" : ""}">
+      <text x="${cx}" y="16" class="viz-top-label" text-anchor="middle">FRONT (0°) ↑</text>
+      <circle cx="${cx}" cy="${cy}" r="96" class="viz-top-ring"/>
+      <line x1="${cx}" y1="${cy - 96}" x2="${cx}" y2="${cy - 88}" class="viz-turret-mark"/>
+      <circle cx="${cx}" cy="${cy}" r="16" class="viz-turret"/>
+      <line x1="${cx}" y1="${cy}" x2="${tip.x}" y2="${tip.y}" class="viz-link"/>
+      <circle cx="${cx}" cy="${cy}" r="5" class="viz-pivot"/>
+      <g transform="rotate(${rollRotate} ${tip.x} ${tip.y})">
+        <line x1="${tip.x}" y1="${tip.y}" x2="${jawTipL.x}" y2="${jawTipL.y}" class="viz-jaw"/>
+        <line x1="${tip.x}" y1="${tip.y}" x2="${jawTipR.x}" y2="${jawTipR.y}" class="viz-jaw"/>
+      </g>
+      <circle cx="${tip.x}" cy="${tip.y}" r="4" class="viz-pivot"/>
+    </g>
+  `;
+}
+
+// Wrist/gripper close-up -- the dedicated spot to read roll and gripper
+// state at a glance: a dashed roll dial with a marker line at the current
+// wrist roll angle, plus jaw lines that open with the gripper fraction and
+// spin with the marker (they share the tool axis).
+function drawWristView(svgEl, pose) {
+  const { wristPitchAngle, gripFrac, stale } = pose;
+  const wristRollDeg = pose.wristRollDeg;
+  const cx = 130, cy = 130, dialR = 62;
+  const stubOrigin = { x: cx - 90, y: cy };
+  const pitchVisual = Math.max(-60, Math.min(60, wristPitchAngle));
+  const stubTip = polarPt(stubOrigin, 90 + pitchVisual, 60);
+  const jawSpread = 10 + gripFrac * 26;
+  const rollRotate = wristRollDeg != null ? wristRollDeg : 0;
+  const jawTipL = polarPt(stubTip, 90 - jawSpread, 34);
+  const jawTipR = polarPt(stubTip, 90 + jawSpread, 34);
+  const marker = polarPt(stubTip, rollRotate, dialR * 0.6);
+
+  svgEl.setAttribute("viewBox", "0 0 260 260");
+  svgEl.innerHTML = `
+    <g class="${stale ? "viz-stale" : ""}">
+      <line x1="${stubOrigin.x - 24}" y1="${stubOrigin.y}" x2="${stubOrigin.x}" y2="${stubOrigin.y}" class="viz-link-wrist"/>
+      <line x1="${stubOrigin.x}" y1="${stubOrigin.y}" x2="${stubTip.x}" y2="${stubTip.y}" class="viz-link viz-link-wrist"/>
+      <circle cx="${stubTip.x}" cy="${stubTip.y}" r="${dialR}" class="viz-roll-ring"/>
+      <line x1="${stubTip.x}" y1="${stubTip.y}" x2="${marker.x}" y2="${marker.y}" class="viz-roll-marker"/>
+      <line x1="${stubTip.x}" y1="${stubTip.y}" x2="${jawTipL.x}" y2="${jawTipL.y}" class="viz-jaw"/>
+      <line x1="${stubTip.x}" y1="${stubTip.y}" x2="${jawTipR.x}" y2="${jawTipR.y}" class="viz-jaw"/>
+      <circle cx="${stubTip.x}" cy="${stubTip.y}" r="5" class="viz-pivot"/>
+      <text x="${cx}" y="248" class="viz-top-label" text-anchor="middle">roll ${wristRollDeg != null ? wristRollDeg.toFixed(0) + "°" : "n/a"} · grip ${Math.round(gripFrac * 100)}%</text>
+    </g>
+  `;
+}
+
+// ------------------------------------------------------------ simulation --
+function initSimDefaults() {
+  if (state.sim.initialized) return;
+  const gripCfg = getJointCfg(JOINT_GRIPPER);
+  state.sim.angles.gripper = gripCfg.min_deg ?? 0;
+  state.sim.initialized = true;
+}
+
+function resetSimulation() {
+  const gripCfg = getJointCfg(JOINT_GRIPPER);
+  state.sim.angles.base = 0;
+  state.sim.angles.shoulder = 0;
+  state.sim.angles.elbow = 0;
+  state.sim.angles.gripper = gripCfg.min_deg ?? 0;
+  state.sim.wristPitch = 0;
+  state.sim.wristRoll = 0;
+  renderSimViz();
+  showToast("Simulated pose reset.", "info");
+}
+$("btnSimReset").addEventListener("click", resetSimulation);
+
+$("simGamepadToggle").addEventListener("change", (e) => {
+  state.sim.enabled = e.target.checked;
+  lastSimTick = null;
+  showToast(
+    state.sim.enabled
+      ? "Simulation: gamepad now drives the preview only -- no commands are sent to the arm."
+      : "Simulation stopped.",
+    "info"
+  );
+});
+
+let lastSimTick = null;
+function stepSimulation(gp) {
+  const now = performance.now();
+  if (lastSimTick == null) { lastSimTick = now; return; }
+  const dt = Math.min(0.1, (now - lastSimTick) / 1000);
+  lastSimTick = now;
+
+  const shCfg = getJointCfg(JOINT_SHOULDER), elCfg = getJointCfg(JOINT_ELBOW),
+        baseCfg = getJointCfg(JOINT_BASE), gripCfg = getJointCfg(JOINT_GRIPPER);
+  const wd = (state.config && state.config.wrist_diff) || {};
+  const pitchMin = wd.pitch_min_deg ?? -90, pitchMax = wd.pitch_max_deg ?? 90;
+  const rollMin = wd.roll_min_deg ?? -180, rollMax = wd.roll_max_deg ?? 180;
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const rate = gpRateScale(gp);
+  const AXIS_RATE = 90, HOLD_RATE = 60;
+
+  state.sim.angles.base = clamp(
+    state.sim.angles.base + applyDeadzone(bindingAxisValue(gp, "axisBase")) * rate * AXIS_RATE * dt,
+    baseCfg.min_deg ?? -180, baseCfg.max_deg ?? 180);
+  state.sim.angles.shoulder = clamp(
+    state.sim.angles.shoulder + applyDeadzone(bindingAxisValue(gp, "axisShoulder")) * rate * AXIS_RATE * dt,
+    shCfg.min_deg, shCfg.max_deg);
+  state.sim.angles.elbow = clamp(
+    state.sim.angles.elbow + applyDeadzone(bindingAxisValue(gp, "axisElbow")) * rate * AXIS_RATE * dt,
+    elCfg.min_deg, elCfg.max_deg);
+  state.sim.wristRoll = clamp(
+    state.sim.wristRoll + applyDeadzone(bindingAxisValue(gp, "axisWristRoll")) * rate * AXIS_RATE * dt,
+    rollMin, rollMax);
+
+  if (bindingButtonPressed(gp, "wristPitchPos")) state.sim.wristPitch = clamp(state.sim.wristPitch + HOLD_RATE * dt, pitchMin, pitchMax);
+  if (bindingButtonPressed(gp, "wristPitchNeg")) state.sim.wristPitch = clamp(state.sim.wristPitch - HOLD_RATE * dt, pitchMin, pitchMax);
+  if (bindingButtonPressed(gp, "wristRollPos")) state.sim.wristRoll = clamp(state.sim.wristRoll + HOLD_RATE * dt, rollMin, rollMax);
+  if (bindingButtonPressed(gp, "wristRollNeg")) state.sim.wristRoll = clamp(state.sim.wristRoll - HOLD_RATE * dt, rollMin, rollMax);
+  if (bindingButtonPressed(gp, "gripperOpen")) state.sim.angles.gripper = clamp(state.sim.angles.gripper + HOLD_RATE * dt, gripCfg.min_deg, gripCfg.max_deg);
+  if (bindingButtonPressed(gp, "gripperClose")) state.sim.angles.gripper = clamp(state.sim.angles.gripper - HOLD_RATE * dt, gripCfg.min_deg, gripCfg.max_deg);
+
+  const prev = state.simPrevButtons;
+  const pressed = gp.buttons.map(b => b.pressed);
+  const resetIdx = state.gamepadBindings.resetArm.index;
+  if (pressed[resetIdx] && !prev[resetIdx]) resetSimulation();
+  state.simPrevButtons = pressed;
+
+  renderSimViz();
+}
+
+// ---------------------------------------------------------- gamepad ----
+// Standard Gamepad API mapping (Xbox controller on Chrome/Edge) by
+// default, but every axis/button below is just a lookup into
+// state.gamepadBindings -- rebindable from the Settings tab, and used
+// identically by the Cockpit's live gamepad control and the Simulation
+// tab's local preview. LT/RT are triggers (exposed as buttons with an
+// analog `.value`); everything else is read via `.pressed`.
+const GP_DEADZONE = 0.15;
+
+const DEFAULT_GAMEPAD_BINDINGS = {
+  axisBase:       { type: "axis",   index: 0 },
+  axisShoulder:   { type: "axis",   index: 1 },
+  axisWristRoll:  { type: "axis",   index: 2 },
+  axisElbow:      { type: "axis",   index: 3 },
+  triggerSlow:    { type: "button", index: 6 },   // LT
+  triggerBoost:   { type: "button", index: 7 },   // RT
+  wristPitchNeg:  { type: "button", index: 4 },   // LB
+  wristPitchPos:  { type: "button", index: 5 },   // RB
+  wristRollNeg:   { type: "button", index: 14 },  // D-Pad Left
+  wristRollPos:   { type: "button", index: 15 },  // D-Pad Right
+  gripperOpen:    { type: "button", index: 12 },  // D-Pad Up
+  gripperClose:   { type: "button", index: 13 },  // D-Pad Down
+  gripperStop:    { type: "button", index: 10 },  // L3
+  wristRollStop:  { type: "button", index: 11 },  // R3
+  toggleBase:     { type: "button", index: 1 },   // B
+  toggleShoulder: { type: "button", index: 2 },   // X
+  toggleElbow:    { type: "button", index: 3 },   // Y
+  toggleGripper:  { type: "button", index: 0 },   // A
+  toggleWrist:    { type: "button", index: 8 },   // View / Back
+  resetArm:       { type: "button", index: 9 },   // Menu / Start
+};
+
+const BINDING_LABELS = {
+  axisBase: "Base roll (stick axis)",
+  axisShoulder: "Shoulder (stick axis)",
+  axisWristRoll: "Wrist roll jog (stick axis)",
+  axisElbow: "Elbow (stick axis)",
+  triggerSlow: "Jog rate precision-slow (trigger)",
+  triggerBoost: "Jog rate boost (trigger)",
+  wristPitchNeg: "Wrist pitch \u2212 (hold)",
+  wristPitchPos: "Wrist pitch + (hold)",
+  wristRollNeg: "Wrist roll \u2212 (hold)",
+  wristRollPos: "Wrist roll + (hold)",
+  gripperOpen: "Gripper open (hold)",
+  gripperClose: "Gripper close (hold)",
+  gripperStop: "Gripper stop",
+  wristRollStop: "Wrist roll stop",
+  toggleBase: "Toggle base torque",
+  toggleShoulder: "Toggle shoulder torque",
+  toggleElbow: "Toggle elbow torque",
+  toggleGripper: "Toggle gripper torque",
+  toggleWrist: "Toggle wrist torque",
+  resetArm: "Reset arm (torque off, all joints) / Reset simulated pose",
+};
+
+const ACTION_ORDER = [
+  "axisBase", "axisShoulder", "axisElbow", "axisWristRoll",
+  "triggerBoost", "triggerSlow",
+  "wristPitchNeg", "wristPitchPos", "wristRollNeg", "wristRollPos",
+  "gripperOpen", "gripperClose", "gripperStop", "wristRollStop",
+  "toggleBase", "toggleShoulder", "toggleElbow", "toggleGripper", "toggleWrist", "resetArm",
+];
+
+function loadGamepadBindings() {
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem("armGamepadBindings") || "{}"); } catch (e) { stored = {}; }
+  const merged = {};
+  for (const id of ACTION_ORDER) {
+    merged[id] = Object.assign({}, DEFAULT_GAMEPAD_BINDINGS[id], stored[id] || {});
+  }
+  return merged;
+}
+function saveGamepadBindings() {
+  try { localStorage.setItem("armGamepadBindings", JSON.stringify(state.gamepadBindings)); } catch (e) { /* storage unavailable -- bindings still work for this session */ }
+}
+state.gamepadBindings = loadGamepadBindings();
+
+function bindingText(b) {
+  if (!b) return "--";
+  return b.type === "axis" ? `Axis ${b.index}${b.invert ? " (inverted)" : ""}` : `Button ${b.index}`;
+}
+function bindingButtonPressed(gp, actionId) {
+  const b = state.gamepadBindings[actionId];
+  const btn = b && gp.buttons[b.index];
+  return !!(btn && (btn.pressed || btn.value > 0.5));
+}
+function bindingTriggerValue(gp, actionId) {
+  const b = state.gamepadBindings[actionId];
+  const btn = b && gp.buttons[b.index];
+  return btn ? btn.value : 0;
+}
+function bindingAxisValue(gp, actionId) {
+  const b = state.gamepadBindings[actionId];
+  if (!b) return 0;
+  let v = gp.axes[b.index] || 0;
+  if (b.invert) v = -v;
+  return v;
+}
+
+function buildGamepadLegend() {
+  const wrap = $("gamepadLegend");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  for (const id of ACTION_ORDER) {
+    const el = document.createElement("div");
+    el.className = "gp-item";
+    el.dataset.action = id;
+    el.innerHTML = `<div class="gp-item-key">${bindingText(state.gamepadBindings[id])}</div><div class="gp-item-desc">${BINDING_LABELS[id]}</div>`;
+    wrap.appendChild(el);
+  }
+}
+
+function setupGamepadEvents() {
+  window.addEventListener("gamepadconnected", (e) => {
+    state.gamepad.index = e.gamepad.index;
+    updateGamepadStatusUI(e.gamepad);
+    showToast(`Gamepad connected: ${e.gamepad.id}`, "success");
+  });
+  window.addEventListener("gamepaddisconnected", (e) => {
+    if (state.gamepad.index === e.gamepad.index) {
+      state.gamepad.index = null;
+      updateGamepadStatusUI(null);
+      showToast("Gamepad disconnected.", "warning");
+    }
+  });
+  const existing = navigator.getGamepads ? navigator.getGamepads() : [];
+  for (const gp of existing) {
+    if (gp) { state.gamepad.index = gp.index; updateGamepadStatusUI(gp); break; }
+  }
+}
+
+function updateGamepadStatusUI(gp) {
+  for (const id of ["gamepadStatus", "simGamepadStatus"]) {
+    const el = $(id);
+    if (!el) continue;
+    if (gp) {
+      el.textContent = `Connected: ${gp.id}`;
+      el.classList.add("gp-connected");
+    } else {
+      el.textContent = "No controller detected -- plug in a controller and press any button.";
+      el.classList.remove("gp-connected");
+    }
+  }
+}
+
+$("gamepadEnableToggle").addEventListener("change", (e) => {
+  state.gamepad.enabled = e.target.checked;
+  if (state.gamepad.enabled) {
+    showToast("Gamepad control enabled.", "info");
+  } else {
+    allJogStop();
+    showToast("Gamepad control disabled.", "info");
+  }
+});
+
+function allJogStop() {
+  for (const n of [JOINT_BASE, JOINT_SHOULDER, JOINT_ELBOW, JOINT_WRIST_L, JOINT_WRIST_R, JOINT_GRIPPER]) {
+    if (hasJoint(n)) send({ type: "jog_stop", joint: n });
+  }
+}
+
+function applyDeadzone(v) { return Math.abs(v) < GP_DEADZONE ? 0 : v; }
+
+function gpRateScale(gp) {
+  const rt = bindingTriggerValue(gp, "triggerBoost");
+  const lt = bindingTriggerValue(gp, "triggerSlow");
+  return Math.max(0.08, Math.min(1, 0.35 + 0.65 * rt - 0.25 * lt));
+}
+
+function sendAnalogJog(name, value) {
+  if (!hasJoint(name)) return;
+  send({ type: "jog_analog", joint: name, value });
+}
+
+function wristAxisJogAnalog(axis, value) {
+  const wd = state.config && state.config.wrist_diff;
+  if (wd && wd.enabled) {
+    const signA = axis === "pitch" ? wd.pitch_sign_a : wd.roll_sign_a;
+    const signB = axis === "pitch" ? wd.pitch_sign_b : wd.roll_sign_b;
+    sendAnalogJog(wd.motor_a, value * signA);
+    sendAnalogJog(wd.motor_b, value * signB);
+  } else {
+    // Fallback when the differential wrist isn't configured/enabled: jog
+    // one raw motor as a single-axis proxy rather than doing nothing.
+    sendAnalogJog(axis === "pitch" ? JOINT_WRIST_L : JOINT_WRIST_R, value);
+  }
+}
+
+function wristAxisJogStart(axis, direction) {
+  const wd = state.config && state.config.wrist_diff;
+  if (wd && wd.enabled) {
+    const signA = axis === "pitch" ? wd.pitch_sign_a : wd.roll_sign_a;
+    const signB = axis === "pitch" ? wd.pitch_sign_b : wd.roll_sign_b;
+    if (hasJoint(wd.motor_a)) send({ type: "jog_start", joint: wd.motor_a, direction: direction * signA });
+    if (hasJoint(wd.motor_b)) send({ type: "jog_start", joint: wd.motor_b, direction: direction * signB });
+  } else {
+    const proxy = axis === "pitch" ? JOINT_WRIST_L : JOINT_WRIST_R;
+    if (hasJoint(proxy)) send({ type: "jog_start", joint: proxy, direction });
+  }
+}
+function wristAxisJogStop(axis) {
+  const wd = state.config && state.config.wrist_diff;
+  if (wd && wd.enabled) {
+    if (hasJoint(wd.motor_a)) send({ type: "jog_stop", joint: wd.motor_a });
+    if (hasJoint(wd.motor_b)) send({ type: "jog_stop", joint: wd.motor_b });
+  } else {
+    const proxy = axis === "pitch" ? JOINT_WRIST_L : JOINT_WRIST_R;
+    if (hasJoint(proxy)) send({ type: "jog_stop", joint: proxy });
+  }
+}
+
+function toggleWristTorque() {
+  const names = [JOINT_WRIST_L, JOINT_WRIST_R].filter(hasJoint);
+  if (!names.length) return;
+  const anyOn = names.some(n => state.joints[n] && state.joints[n].enabled);
+  send({ type: anyOn ? "disable_batch" : "enable_batch", joints: names });
+}
+
+function resetArmFromGamepad() {
+  send({ type: "disable_all" });
+  showToast("Gamepad: Reset -- torque disabled on all joints.", "warning");
+}
+
+function handleGamepadAxes(gp) {
+  const rate = gpRateScale(gp);
+  sendAnalogJog(JOINT_BASE, applyDeadzone(bindingAxisValue(gp, "axisBase")) * rate);
+  sendAnalogJog(JOINT_SHOULDER, applyDeadzone(bindingAxisValue(gp, "axisShoulder")) * rate);
+  sendAnalogJog(JOINT_ELBOW, applyDeadzone(bindingAxisValue(gp, "axisElbow")) * rate);
+  wristAxisJogAnalog("roll", applyDeadzone(bindingAxisValue(gp, "axisWristRoll")) * rate);
+}
+
+function handleGamepadButtons(gp) {
+  const prev = state.gamepad.prevButtons;
+  const pressed = gp.buttons.map(b => b.pressed);
+  const idxOf = (actionId) => state.gamepadBindings[actionId].index;
+  const jp = (actionId) => { const i = idxOf(actionId); return pressed[i] && !prev[i]; };
+  const jr = (actionId) => { const i = idxOf(actionId); return !pressed[i] && prev[i]; };
+
+  if (jp("toggleBase")) toggleJointTorque(JOINT_BASE);
+  if (jp("toggleShoulder")) toggleJointTorque(JOINT_SHOULDER);
+  if (jp("toggleElbow")) toggleJointTorque(JOINT_ELBOW);
+  if (jp("toggleGripper")) toggleJointTorque(JOINT_GRIPPER);
+  if (jp("toggleWrist")) toggleWristTorque();
+  if (jp("resetArm")) resetArmFromGamepad();
+
+  if (jp("gripperOpen")) send({ type: "jog_start", joint: JOINT_GRIPPER, direction: 1 });
+  if (jr("gripperOpen")) send({ type: "jog_stop", joint: JOINT_GRIPPER });
+  if (jp("gripperClose")) send({ type: "jog_start", joint: JOINT_GRIPPER, direction: -1 });
+  if (jr("gripperClose")) send({ type: "jog_stop", joint: JOINT_GRIPPER });
+
+  if (jp("wristRollPos")) wristAxisJogStart("roll", 1);
+  if (jr("wristRollPos")) wristAxisJogStop("roll");
+  if (jp("wristRollNeg")) wristAxisJogStart("roll", -1);
+  if (jr("wristRollNeg")) wristAxisJogStop("roll");
+
+  if (jp("wristPitchPos")) wristAxisJogStart("pitch", 1);
+  if (jr("wristPitchPos")) wristAxisJogStop("pitch");
+  if (jp("wristPitchNeg")) wristAxisJogStart("pitch", -1);
+  if (jr("wristPitchNeg")) wristAxisJogStop("pitch");
+
+  if (jp("gripperStop")) send({ type: "jog_stop", joint: JOINT_GRIPPER });
+  if (jp("wristRollStop")) wristAxisJogStop("roll");
+
+  state.gamepad.prevButtons = pressed;
+}
+
+function renderGamepadLegendHighlight(gp) {
+  document.querySelectorAll("#gamepadLegend .gp-item").forEach(el => {
+    const id = el.dataset.action;
+    const b = state.gamepadBindings[id];
+    if (!b) return;
+    const active = b.type === "axis"
+      ? Math.abs(applyDeadzone(bindingAxisValue(gp, id))) > 0
+      : (bindingButtonPressed(gp, id) || bindingTriggerValue(gp, id) > 0.1);
+    el.classList.toggle("active", active);
+  });
+}
+
+// One RAF loop drives three independent consumers of the same physical
+// gamepad: (1) live hardware jog, gated by the Cockpit "Enable gamepad
+// control" checkbox; (2) the Simulation tab's local preview, gated by its
+// own checkbox -- runs even with no motors connected since it never talks
+// to the backend; (3) Settings-tab keybind capture, whichever is active.
+// All three read through state.gamepadBindings so a rebind in Settings
+// takes effect everywhere immediately.
+let lastGpSend = 0;
+function pollGamepad() {
+  requestAnimationFrame(pollGamepad);
+  const gp = state.gamepad.index != null ? navigator.getGamepads()[state.gamepad.index] : null;
+  if (!gp) return;
+
+  if (state.listeningFor) tryCaptureBinding(gp);
+
+  if (state.gamepad.enabled) {
+    handleGamepadButtons(gp);
+    const now = performance.now();
+    if (now - lastGpSend >= 40) {
+      lastGpSend = now;
+      handleGamepadAxes(gp);
+      renderGamepadLegendHighlight(gp);
+    }
+  }
+
+  if (state.sim.enabled) stepSimulation(gp);
 }
 
 function renderJointCard(s) {
@@ -416,6 +1165,7 @@ document.addEventListener("keydown", (e) => {
   if (tag === "input" || tag === "select" || tag === "textarea") return;
   if (e.repeat) return;
   const k = e.key.toLowerCase();
+  if (k === "escape" && state.listeningFor) { cancelListening(); return; }
   if (k === "x" || k === "escape") {
     send({ type: "estop" });
     fetch("/api/estop", { method: "POST" });
@@ -473,6 +1223,9 @@ function renderWristStatus(msg) {
   $("wristTgtRoll").textContent = msg.target_roll != null ? `${msg.target_roll.toFixed(2)}°` : "--";
   state.wristTargetPitch = msg.target_pitch;
   state.wristTargetRoll = msg.target_roll;
+  state.wristPitchActual = msg.pitch;
+  state.wristRollActual = msg.roll;
+  maybeRenderViz();
 }
 
 // Wrist nudge: same customizable jog step as the Control tab, applied to
@@ -727,5 +1480,152 @@ $("logLevelFilter").addEventListener("change", reapplyLogFilter);
 $("logJointFilter").addEventListener("change", reapplyLogFilter);
 $("btnClearLogView").addEventListener("click", () => { $("logView").innerHTML = ""; });
 
+// --------------------------------------------------- settings: keybinds --
+function renderKeybindTable() {
+  const tbody = $("keybindTableBody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  for (const id of ACTION_ORDER) {
+    const b = state.gamepadBindings[id];
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${BINDING_LABELS[id]}</td>
+      <td class="mono-val" id="kb-current-${id}">${bindingText(b)}</td>
+      <td>${b.type === "axis" ? `<label class="chk"><input type="checkbox" class="kb-invert" data-action="${id}" ${b.invert ? "checked" : ""}> Invert</label>` : ""}</td>
+      <td><button class="btn btn-secondary kb-listen" data-action="${id}">Listen</button></td>
+    `;
+    tbody.appendChild(tr);
+  }
+  tbody.querySelectorAll(".kb-listen").forEach(btn => {
+    btn.addEventListener("click", () => startListening(btn.dataset.action, btn));
+  });
+  tbody.querySelectorAll(".kb-invert").forEach(cb => {
+    cb.addEventListener("change", (e) => {
+      state.gamepadBindings[e.target.dataset.action].invert = e.target.checked;
+      saveGamepadBindings();
+    });
+  });
+}
+
+function startListening(actionId, btnEl) {
+  if (state.gamepad.index == null) {
+    showToast("Connect a gamepad first -- press any button on it.", "error");
+    return;
+  }
+  if (state.listeningFor === actionId) { cancelListening(); return; }
+  cancelListening();
+  const gp = navigator.getGamepads()[state.gamepad.index];
+  state.listeningFor = actionId;
+  state.listenBaseline = {
+    axes: gp ? gp.axes.slice() : [],
+    buttons: gp ? gp.buttons.map(b => b.pressed) : [],
+  };
+  state.listenBtnEl = btnEl;
+  state.listenStarted = performance.now();
+  btnEl.textContent = "Listening… (Esc to cancel)";
+  btnEl.classList.add("kb-listening");
+}
+
+function cancelListening() {
+  if (state.listenBtnEl) {
+    state.listenBtnEl.textContent = "Listen";
+    state.listenBtnEl.classList.remove("kb-listening");
+  }
+  state.listeningFor = null;
+  state.listenBaseline = null;
+  state.listenBtnEl = null;
+}
+
+function tryCaptureBinding(gp) {
+  if (!state.listeningFor || !state.listenBaseline) return;
+  if (performance.now() - state.listenStarted > 12000) {
+    cancelListening();
+    showToast("Keybind: timed out waiting for input.", "warning");
+    return;
+  }
+  const actionId = state.listeningFor;
+  const type = state.gamepadBindings[actionId].type;
+  if (type === "axis") {
+    for (let i = 0; i < gp.axes.length; i++) {
+      const base = state.listenBaseline.axes[i] || 0;
+      if (Math.abs(gp.axes[i] - base) > 0.5) {
+        state.gamepadBindings[actionId].index = i;
+        finishListening(actionId, `Axis ${i}`);
+        return;
+      }
+    }
+  } else {
+    for (let i = 0; i < gp.buttons.length; i++) {
+      const wasPressed = state.listenBaseline.buttons[i];
+      const isPressed = gp.buttons[i] && (gp.buttons[i].pressed || gp.buttons[i].value > 0.5);
+      if (isPressed && !wasPressed) {
+        state.gamepadBindings[actionId].index = i;
+        finishListening(actionId, `Button ${i}`);
+        return;
+      }
+    }
+  }
+}
+
+function finishListening(actionId, text) {
+  saveGamepadBindings();
+  cancelListening();
+  renderKeybindTable();
+  buildGamepadLegend();
+  showToast(`${BINDING_LABELS[actionId]} bound to ${text}.`, "success");
+}
+
+$("btnKeybindReset").addEventListener("click", () => {
+  if (!confirm("Reset all gamepad keybinds to their defaults?")) return;
+  state.gamepadBindings = JSON.parse(JSON.stringify(DEFAULT_GAMEPAD_BINDINGS));
+  saveGamepadBindings();
+  renderKeybindTable();
+  buildGamepadLegend();
+  showToast("Gamepad keybinds reset to defaults.", "info");
+});
+
+renderKeybindTable();
+
+// ------------------------------------------------- cockpit view switcher --
+document.querySelectorAll("#vizViewTabs .viz-view-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    state.vizView = btn.dataset.view;
+    document.querySelectorAll("#vizViewTabs .viz-view-btn").forEach(b => b.classList.toggle("active", b === btn));
+    renderArmViz();
+  });
+});
+
 initTabs();
+setupGamepadEvents();
+pollGamepad();
 connect();
+
+// ------------------------------------------------------ nav rail / shell --
+// Collapsible rail (desktop) + slide-in drawer (mobile). Purely presentational
+// -- doesn't touch any websocket/command logic above.
+(function initShell() {
+  const shell = document.getElementById("appShell");
+  const railToggle = document.getElementById("railToggle");
+  const mobileBtn = document.getElementById("mobileNavBtn");
+  const scrim = document.getElementById("railScrim");
+  if (!shell) return;
+
+  const RAIL_KEY = "armRailCollapsed";
+  try {
+    if (localStorage.getItem(RAIL_KEY) === "1") shell.classList.add("rail-collapsed");
+  } catch (e) { /* storage unavailable */ }
+
+  if (railToggle) {
+    railToggle.addEventListener("click", () => {
+      shell.classList.toggle("rail-collapsed");
+      try { localStorage.setItem(RAIL_KEY, shell.classList.contains("rail-collapsed") ? "1" : "0"); } catch (e) {}
+    });
+  }
+  function openNav() { shell.classList.add("nav-open"); }
+  function closeNav() { shell.classList.remove("nav-open"); }
+  if (mobileBtn) mobileBtn.addEventListener("click", openNav);
+  if (scrim) scrim.addEventListener("click", closeNav);
+  document.querySelectorAll("#tabbar .tab-btn").forEach(btn => {
+    btn.addEventListener("click", closeNav);
+  });
+})();

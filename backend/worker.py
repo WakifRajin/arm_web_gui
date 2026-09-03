@@ -390,6 +390,23 @@ class Worker(threading.Thread):
                                         f"[{name}] jog step {cmd['direction'] * cmd['step_deg']:+.3f} deg "
                                         f"-> target {clamped:.2f} deg" +
                                         (" (clamped to limit)" if was_clamped else "")})
+            elif t == "jog_analog":
+                # Continuous, proportional-rate jog for analog stick input
+                # (gamepad). Same underlying mechanism as jog_start/
+                # jog_stop -- both just set self.jog_active[name], which
+                # _tick_ramps() multiplies by max_speed_deg_s every tick --
+                # but here the magnitude is a float in [-1, 1] instead of
+                # a fixed -1/0/1, so stick deflection controls rate
+                # smoothly instead of only full-speed on/off. Silently
+                # ignored (no Event Log entry) when torque is off, since
+                # this can arrive at ~25 Hz while a stick is held, unlike
+                # the one-shot jog_start/jog_stop clicks -- logging every
+                # ignored frame would flood the log far worse than a
+                # single "torque is OFF" notice would help.
+                if name in self.arm.enabled:
+                    self.jog_active[name] = max(-1.0, min(1.0, cmd.get("value", 0.0)))
+                elif name in self.jog_active:
+                    self.jog_active[name] = 0.0
             elif t == "set_position_gains":
                 self.arm.set_position_gains(name, cmd["kp"], cmd["ki"])
             elif t == "set_velocity_gains":

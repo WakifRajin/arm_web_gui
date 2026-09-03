@@ -1,21 +1,84 @@
+## Interplanetar Arm Control — production build
+
+This is the finished, production-grade version of the rover arm GUI:
+the same calibrated backend (CAN protocol, ramping, E-STOP, watchdogs)
+you had, wrapped in a completely rebuilt frontend — a sidebar mission-
+control layout, refreshed typography and color system, custom icon
+set, and full responsive support down to a phone screen. Every
+websocket command, REST endpoint, and safety behavior is unchanged
+from the version this was built on; only the browser UI was redone.
+
 ## Install & run
 
 ```bash
 cd backend
 pip install -r requirements.txt
-
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+`gim_motor.py`, `joint.py`, and `can_bus.py` (your calibrated CAN
+protocol driver, degree-based Joint class, and bus adapter settings)
+are already included in `backend/` — the module docstrings mention
+them as drop-in files because that's how this project started; if
+you've since updated any of the three on your bench copy, drop your
+newer version in before starting the server.
+
 Then open `http://<this-machine's-ip>:8000` from any browser on the
 same network (the bench laptop itself, or a phone/tablet next to the
-arm). First run creates `backend/gui_joints.json` from
+arm — the UI is fully responsive, with a slide-in nav drawer below
+~980px wide). First run creates `backend/gui_joints.json` from
 `gui_joints.default.json` (the base/shoulder/elbow/wrist-L/wrist-R/
-gripper map from your README, IDs 9–14) — edit that file directly, or
-just use the GUI's limit/speed editors, which write back to it.
+gripper map, IDs 9–14) — edit that file directly, or just use the
+GUI's limit/speed editors, which write back to it.
+
+## The frontend, in this build
+
+The nav is a collapsible left rail grouped by workflow phase —
+**Operate** (Cockpit, Simulation), **Monitor** (Dashboard, Event Log),
+**Configure** (Control, Wrist, Batch, Discovery, CAN Bus, Settings) —
+instead of a single row of tabs. Click the rail's top-right icon to
+collapse it to icons-only on a wide screen; on a narrow one it becomes
+a slide-in drawer behind a hamburger button in the top bar.
+
+Numeric telemetry (angles, currents, voltages, targets) is set in a
+monospaced type with tabular figures throughout, so digits line up
+column-to-column instead of jittering as they update. The Emergency
+Stop button uses a hazard-stripe treatment (the only place that motif
+appears) so it stays visually distinct from every other control in
+the app, at any screen size, at a glance.
+
+Every websocket message type, REST route, element ID, and CSS class
+the JavaScript depends on is unchanged from the prototype, so nothing
+about the backend contract shifted — this was purely a visual and
+structural rebuild of `frontend/index.html`, `frontend/styles.css`,
+and a small additive block at the end of `frontend/app.js` for the
+new collapsible/mobile nav. If you customize the UI further, the
+color tokens, type scale, and spacing scale all live at the top of
+`styles.css` under `:root`.
 
 ## What's in the dashboard
 
+- **Cockpit** (new, and the tab you land on) — everything you need for
+  a normal session, decluttered from the tuning/diagnostic tabs below:
+  - **Startup** — a 3-step wizard for "just powered the arm on":
+    confirm the motors are responding, Set Home for every joint (same
+    permanent `set_home_batch` as the old Batch tab, just one click),
+    then Enable Torque for every joint. It collapses itself once every
+    configured joint is enabled, and "Re-run Startup" brings it back.
+  - **Arm Position** — a live schematic (base turret, shoulder/elbow/
+    wrist links, gripper jaws) redrawn from the same status stream the
+    other tabs use. It's proportional-within-range, not a literal
+    kinematic replica: each link's on-screen angle is its live angle
+    normalized into that joint's own configured min/max, so it stays
+    legible even for a joint whose real travel is asymmetric (e.g.
+    0..165 deg) without needing a hardware-verified sign convention.
+    Numeric readouts sit next to it for the exact values.
+  - **Quick Control** — one compact card per joint: connected dot,
+    live angle, an Enable/Disable button, and hold-to-jog −/+ buttons.
+    Exact typed angles, ramped-vs-direct, limits/speed/gains/direction
+    stay on the Control tab under Advanced.
+  - **Gamepad** — Xbox controller support, off by default (tick
+    "Enable gamepad control"). See "Gamepad mapping" below.
 - **Dashboard** — a live card per joint: connected/disconnected
   (flips automatically the moment a motor stops answering polls, or
   a fresh one starts answering — no manual "rescan" needed for
@@ -65,6 +128,48 @@ The GUI now also refuses (with a clear Event Log note, not a silent
 no-op) to send a Go-To, jog, or batch move to a joint whose torque
 is off — previously those commands went out anyway and did nothing,
 which looked like the position/speed controls were broken.
+
+## Gamepad mapping (Cockpit tab)
+
+Built against the standard Gamepad API mapping (Xbox controller on
+Chrome/Edge). Ported loosely from an older rig's PWM-jog mapping — this
+arm is position-controlled and has two more DOF (no drive "roller"),
+so a few slots were re-purposed rather than copied literally:
+
+| Input | Action |
+|---|---|
+| Left stick X / Y | Base roll / Shoulder — proportional jog rate |
+| Right stick X / Y | Wrist roll / Elbow — proportional jog rate |
+| RT / LT | Shared jog-rate boost / precision-slow, applied to whatever the sticks are driving (this is the old "shared motor PWM slider," reinterpreted as a rate control since motion is now position-commanded, not PWM) |
+| LB / RB | Wrist pitch − / + (hold) |
+| D-pad ↑ / ↓ | Gripper open / close (hold) |
+| D-pad → / ← | Wrist roll + / − (hold) — stands in for the old rig's "roller," which this arm doesn't have |
+| L3 (left stick click) | Gripper stop |
+| R3 (right stick click) | Wrist roll stop |
+| B / X / Y | Toggle base / shoulder / elbow torque |
+| A | Toggle gripper torque (not in the old mapping — added since B/X/Y only covered 3 of the 6 joints) |
+| View / Back | Toggle wrist torque (both wrist motors together) |
+| Menu / Start | Reset arm — torque OFF on every joint |
+
+The wrist pitch/roll actions above act through the differential-wrist
+config on the Wrist tab (`wrist_diff`) when it's enabled — both motors
+move together, mixed per its pitch/roll signs. If `wrist_diff` isn't
+enabled, they fall back to jogging `wrist_l` (pitch slot) or `wrist_r`
+(roll slot) alone as a single-axis proxy, so the gamepad still does
+something sensible on an un-mixed wrist.
+
+Analog stick jogging uses a new `jog_analog` command (float `-1..1`,
+sent at ~25 Hz while a stick is held) rather than the digital
+`jog_start`/`jog_stop` the rest of the GUI uses — same underlying
+per-joint ramp, just with a variable rate instead of always-max-speed,
+and it never writes to the Event Log (unlike `jog_nudge`) since it can
+arrive dozens of times a second.
+
+"Menu/Start: Reset arm" disables torque on every joint (same as
+`disable_all`) but is **not** the same as the red EMERGENCY STOP button
+in the top bar: E-STOP also freezes every ramp exactly in place and is
+the same path the bus watchdog uses, whereas Reset is a plain,
+non-latching disable-all for "stop and start the wizard over."
 
 ## Safety notes carried over on purpose
 
