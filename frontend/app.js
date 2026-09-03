@@ -13,6 +13,16 @@ const state = {
   jointOrder: [],
 };
 
+// Customizable jog step, ported from diff_wrist.py's JOG_STEPS_DEG /
+// bracket-key cycling -- the old jog was a single fixed-speed hold with
+// no way to dial in a precise increment, which is the "jog is confusing
+// and non-customizable" complaint. One shared step applies to whichever
+// joint/axis is currently selected (arm joint on the Control tab, or
+// pitch/roll on the Wrist tab).
+const JOG_STEPS = [0.1, 0.5, 1, 2, 5, 10, 30];
+let jogStep = 1;
+let jogStepIndex = JOG_STEPS.indexOf(1);
+
 const LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"];
 
 function $(id) { return document.getElementById(id); }
@@ -343,7 +353,7 @@ $("btnSaveGains").addEventListener("click", () => {
   showToast(`${name}: gains sent -- check Event Log to confirm the driver accepted them.`, "info");
 });
 
-// jog: hold to move, release/leave to stop
+// jog: hold to move continuously (soft-ramped, existing behaviour)
 function bindJog(btnId, direction) {
   const btn = $(btnId);
   const start = () => send({ type: "jog_start", joint: state.selectedJoint, direction });
@@ -354,6 +364,77 @@ function bindJog(btnId, direction) {
 }
 bindJog("jogNeg", -1);
 bindJog("jogPos", 1);
+
+// jog: customizable-step nudge -- one tap moves exactly `jogStep` degrees,
+// ported from diff_wrist.py's incremental keyboard jog (JOG_STEPS_DEG,
+// cycled with [ / ]) so precise positioning doesn't depend on how long a
+// mouse button was held.
+function buildJogStepChips() {
+  const wrap = $("jogStepChips");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  for (const step of JOG_STEPS) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "jog-step-chip" + (step === jogStep ? " active" : "");
+    chip.textContent = step < 1 ? step.toFixed(1) : `${step}`;
+    chip.addEventListener("click", () => setJogStep(step));
+    wrap.appendChild(chip);
+  }
+}
+function setJogStep(step) {
+  jogStep = Math.max(0.01, step);
+  const idx = JOG_STEPS.indexOf(jogStep);
+  jogStepIndex = idx >= 0 ? idx : jogStepIndex;
+  buildJogStepChips();
+  if ($("jogStepCustom") && document.activeElement !== $("jogStepCustom")) {
+    $("jogStepCustom").value = jogStep;
+  }
+}
+function cycleJogStep(dir) {
+  jogStepIndex = Math.max(0, Math.min(JOG_STEPS.length - 1, jogStepIndex + dir));
+  setJogStep(JOG_STEPS[jogStepIndex]);
+}
+$("jogStepCustom") && $("jogStepCustom").addEventListener("change", (e) => {
+  const v = parseFloat(e.target.value);
+  if (!Number.isNaN(v) && v > 0) setJogStep(v);
+});
+function nudge(direction) {
+  if (!state.selectedJoint) return;
+  send({ type: "jog_nudge", joint: state.selectedJoint, direction, step_deg: jogStep });
+}
+$("jogNudgeNeg") && $("jogNudgeNeg").addEventListener("click", () => nudge(-1));
+$("jogNudgePos") && $("jogNudgePos").addEventListener("click", () => nudge(1));
+buildJogStepChips();
+setJogStep(jogStep);
+
+// keyboard shortcuts (Control tab only, and never while typing into a
+// field) -- ported from diff_wrist.py's key bindings: hold arrows to jog,
+// [ ] to cycle step, , . to nudge by the current step, X/Esc to E-STOP.
+document.addEventListener("keydown", (e) => {
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "select" || tag === "textarea") return;
+  if (e.repeat) return;
+  const k = e.key.toLowerCase();
+  if (k === "x" || k === "escape") {
+    send({ type: "estop" });
+    fetch("/api/estop", { method: "POST" });
+    return;
+  }
+  const onControl = document.getElementById("tab-control").classList.contains("active");
+  if (!onControl || !state.selectedJoint) return;
+  if (k === "[") { cycleJogStep(-1); return; }
+  if (k === "]") { cycleJogStep(1); return; }
+  if (k === ",") { nudge(-1); return; }
+  if (k === ".") { nudge(1); return; }
+  if (e.key === "ArrowLeft") { send({ type: "jog_start", joint: state.selectedJoint, direction: -1 }); e.preventDefault(); return; }
+  if (e.key === "ArrowRight") { send({ type: "jog_start", joint: state.selectedJoint, direction: 1 }); e.preventDefault(); return; }
+});
+document.addEventListener("keyup", (e) => {
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    if (state.selectedJoint) send({ type: "jog_stop", joint: state.selectedJoint });
+  }
+});
 
 // ------------------------------------------------------------- wrist ----
 function populateWristConfigUI() {
@@ -390,7 +471,27 @@ function renderWristStatus(msg) {
   $("wristCurRoll").textContent = msg.roll != null ? `${msg.roll.toFixed(2)}°` : "--";
   $("wristTgtPitch").textContent = msg.target_pitch != null ? `${msg.target_pitch.toFixed(2)}°` : "--";
   $("wristTgtRoll").textContent = msg.target_roll != null ? `${msg.target_roll.toFixed(2)}°` : "--";
+  state.wristTargetPitch = msg.target_pitch;
+  state.wristTargetRoll = msg.target_roll;
 }
+
+// Wrist nudge: same customizable jog step as the Control tab, applied to
+// whichever axis was pressed, sent as a ramped wrist_go relative to the
+// last known target (falls back to 0 if the wrist hasn't reported yet).
+function nudgeWrist(axis, direction) {
+  if (!state.config || !state.config.wrist_diff || !state.config.wrist_diff.enabled) {
+    showToast("Wrist: differential wrist isn't enabled -- save the Mixing Config first.", "error");
+    return;
+  }
+  const pitch_deg = (state.wristTargetPitch ?? 0) + (axis === "pitch" ? direction * jogStep : 0);
+  const roll_deg = (state.wristTargetRoll ?? 0) + (axis === "roll" ? direction * jogStep : 0);
+  send({ type: "wrist_go", pitch_deg, roll_deg, ramped: $("wristRampedToggle").checked });
+}
+$("wristPitchNudgeNeg") && $("wristPitchNudgeNeg").addEventListener("click", () => nudgeWrist("pitch", -1));
+$("wristPitchNudgePos") && $("wristPitchNudgePos").addEventListener("click", () => nudgeWrist("pitch", 1));
+$("wristRollNudgeNeg") && $("wristRollNudgeNeg").addEventListener("click", () => nudgeWrist("roll", -1));
+$("wristRollNudgePos") && $("wristRollNudgePos").addEventListener("click", () => nudgeWrist("roll", 1));
+
 
 $("btnWristGo").addEventListener("click", () => {
   const pitch_deg = parseFloat($("wristPitchInput").value);

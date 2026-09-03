@@ -43,15 +43,20 @@ import can
 from gim_motor import GimMotor, GimTimeout
 from joint import Joint
 from can_bus import get_bus
+from can_link import PUBLIC_ADDR, CMD_VERSION, CMD_STATUS, CMD_SET_ADDR
 
 from logs import log_event
 
-# ---- raw discovery protocol, ported 1:1 from can_scanner.py --------------
-PUBLIC_ADDR = 0xFF
-CMD_VERSION = 0xA0
-CMD_STATUS = 0xAE
-CMD_SET_ADDR = 0xBA
 MIN_PROTOCOL_FOR_0xBA = 0x08
+# Driver-side comms watchdog (0xCD), requires the same protocol floor as
+# 0xBA. Ported from diff_wrist.py: if the host process dies or the CAN
+# link drops while a joint's torque is on, the DRIVER itself cuts torque
+# after this many ms with no host involved at all -- a hardware-level
+# backstop underneath the browser's bus-watchdog / E-STOP, which can only
+# react once something on the host side notices. The old arm backend
+# never sent this frame.
+MIN_PROTOCOL_FOR_WATCHDOG = 0x08
+DRIVER_WATCHDOG_MS = 300
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "gui_joints.json")
@@ -158,6 +163,12 @@ class ArmController:
             )
             self.joints[j["name"]] = joint
             self.motors[j["name"]] = motor
+            # Fire a version request in the background right away (never
+            # blocks connect()) so enable() below already knows whether
+            # this joint's firmware supports the 0xCD comms watchdog by
+            # the time anyone arms it, instead of stalling the first
+            # enable() while it waits.
+            motor.link.read_version(motor.addr)
         log_event("info", f"Connected to CAN bus, {len(self.joints)} joints configured.")
 
     # ---- per-joint status ----------------------------------------------
@@ -216,6 +227,17 @@ class ArmController:
         current_angle = joint.get_angle()
         joint.set_angle(current_angle)
         self.enabled.add(name)
+
+        motor = self.motors[name]
+        st = motor.link.state(motor.addr)
+        pv = st.protocol_version if st else None
+        if pv is not None and pv >= MIN_PROTOCOL_FOR_WATCHDOG:
+            motor.set_driver_watchdog(True, DRIVER_WATCHDOG_MS)
+        else:
+            log_event("warning", f"{name}: protocol {pv} predates 0xCD (or unknown yet) -- "
+                                  f"no driver-side comms watchdog for this joint, host "
+                                  f"watchdog/E-STOP only", joint=name)
+
         log_event("info", f"{name}: enabled (holding {current_angle:.2f} deg)", joint=name)
 
     def disable(self, name: str):
@@ -541,38 +563,36 @@ class ArmController:
 
     # ---- raw broadcast discovery (ported from can_scanner.py) --------
     def scan_broadcast(self, window_s: float = 0.5) -> List[dict]:
-        """Pings the broadcast address and listens for replies, exactly
-        like can_scanner.py's _execute_scan(). Must only be called from
-        the single thread that owns self.bus (the Worker loop), so it
-        never races with normal joint polling on the same bus."""
+        """Pings the broadcast address and reads whatever answers out of
+        the shared CanLink's frame cache -- NOT a private bus.recv() loop
+        any more. Now that CanLink's RX thread is the only thing that
+        ever calls bus.recv() (see can_link.py), a second direct reader
+        here would just race it for frames unpredictably instead of
+        actually seeing all of them."""
         if not self.bus:
             return []
+        link = next(iter(self.motors.values())).link if self.motors else None
+        if link is None:
+            return []
         configured_addrs = {j["addr"] for j in self.config["joints"]}
+        start = time.monotonic()
         try:
-            for cmd in (CMD_VERSION, CMD_STATUS):
-                msg = can.Message(arbitration_id=PUBLIC_ADDR, data=bytes([cmd]), is_extended_id=False)
-                self.bus.send(msg, timeout=0.05)
-
-            end_time = time.monotonic() + window_s
-            while time.monotonic() < end_time:
-                m = self.bus.recv(timeout=max(0.0, end_time - time.monotonic()))
-                if m is None:
+            link.send_broadcast(CMD_VERSION)
+            link.send_broadcast(CMD_STATUS)
+            time.sleep(window_s)
+            for dev, f in link.frames_since(start).items():
+                if not (1 <= dev <= 254):
                     continue
-                dev = m.arbitration_id
-                d = bytes(m.data)
-                if not (1 <= dev <= 254) or not d:
-                    continue
+                d = f["data"]
                 entry = self.discovered.setdefault(dev, {"addr": dev})
                 entry["last_seen"] = time.time()
-                if d[0] == CMD_VERSION and len(d) >= 8:
+                if f["code"] == CMD_VERSION and len(d) >= 8:
                     entry["app_fw"] = int.from_bytes(d[3:5], "little")
                     entry["protocol"] = d[7]
-                elif d[0] == CMD_STATUS and len(d) >= 8:
+                elif f["code"] == CMD_STATUS and len(d) >= 8:
                     entry["voltage"] = int.from_bytes(d[1:3], "little") * 0.01
                     entry["temperature"] = d[5]
                     entry["fault"] = d[7]
-        except can.CanOperationError:
-            pass
         except Exception as e:
             log_event("error", f"scan error: {e}")
 
@@ -599,15 +619,18 @@ class ArmController:
         if entry["protocol"] < MIN_PROTOCOL_FOR_0xBA:
             raise ValueError(f"device protocol 0x{entry['protocol']:02X} is below 0x{MIN_PROTOCOL_FOR_0xBA:02X}; "
                               f"use the RS485 ZE300_GUI to set this address instead")
-        msg = can.Message(arbitration_id=old_addr, data=bytes([CMD_SET_ADDR, new_addr]), is_extended_id=False)
-        self.bus.send(msg, timeout=0.05)
+        link = next(iter(self.motors.values())).link if self.motors else None
+        if link is None:
+            raise ValueError("no CAN link available -- connect first")
+        start = time.monotonic()
+        link.send(old_addr, bytes([CMD_SET_ADDR, new_addr]))
         ack = False
-        end = time.monotonic() + 0.5
+        end = start + 0.5
         while time.monotonic() < end:
-            m = self.bus.recv(timeout=0.1)
-            if m and bytes(m.data) and bytes(m.data)[0] == CMD_SET_ADDR:
+            if link.frame_since(old_addr, CMD_SET_ADDR, start) is not None:
                 ack = True
                 break
+            time.sleep(0.01)
         if ack:
             log_event("info", f"Device {old_addr} acknowledged address change to {new_addr}. "
                                f"Power-cycle the motor to finalize.")

@@ -92,10 +92,17 @@
 
         <div class="control-card">
           <h3>Jog</h3>
-          <p class="hint">Hold to move (soft-ramped). Release to stop. Torque must be on.</p>
+          <p class="hint">Hold ◀/▶ to jog continuously (soft-ramped). Tap a step chip, then use the step buttons — or <kbd>,</kbd>/<kbd>.</kbd> — for one exact-size nudge at a time. <kbd>[</kbd>/<kbd>]</kbd> cycles the step. Torque must be on.</p>
+          <div class="jog-step-row">
+            <span class="jog-step-label">Step</span>
+            <div id="jogStepChips" class="jog-step-chips"></div>
+            <input id="jogStepCustom" type="number" step="0.01" min="0.01" class="jog-step-custom" title="Custom step size (deg)">
+          </div>
           <div class="jog-buttons">
-            <button id="jogNeg" class="btn btn-jog">&#8592; Negative</button>
-            <button id="jogPos" class="btn btn-jog">Positive &#8594;</button>
+            <button id="jogNeg" class="btn btn-jog" title="Hold to jog continuously">&#8592; Hold</button>
+            <button id="jogNudgeNeg" class="btn btn-jog btn-jog-step">&#8722; step</button>
+            <button id="jogNudgePos" class="btn btn-jog btn-jog-step">+ step</button>
+            <button id="jogPos" class="btn btn-jog" title="Hold to jog continuously">Hold &#8594;</button>
           </div>
         </div>
 
@@ -152,6 +159,13 @@
           <div class="field-row"><label>Roll (deg)</label><input id="wristRollInput" type="number" step="0.1" value="0"></div>
           <div class="field-row"><label class="chk"><input id="wristRampedToggle" type="checkbox" checked> Ramped move (soft-start/stop)</label></div>
           <button id="btnWristGo" class="btn btn-primary full-width">Go To Pitch/Roll</button>
+          <p class="hint">Nudge by the same jog step chosen on the Control tab (currently shown there).</p>
+          <div class="jog-buttons">
+            <button id="wristPitchNudgeNeg" class="btn btn-jog btn-jog-step" title="Pitch −step">Pitch −</button>
+            <button id="wristPitchNudgePos" class="btn btn-jog btn-jog-step" title="Pitch +step">Pitch +</button>
+            <button id="wristRollNudgeNeg" class="btn btn-jog btn-jog-step" title="Roll −step">Roll −</button>
+            <button id="wristRollNudgePos" class="btn btn-jog btn-jog-step" title="Roll +step">Roll +</button>
+          </div>
           <p class="hint hint-block">Both motors must have torque ON. Pitch/roll are clamped to the limits below before mixing. If a legal pitch+roll combination would still ask a motor to travel past its own limit, both targets are scaled back together (direction preserved, magnitude reduced) rather than letting one motor clamp on its own — the Event Log shows the achieved pitch/roll when that happens.</p>
         </div>
 

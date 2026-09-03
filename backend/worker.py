@@ -14,6 +14,27 @@ The E-STOP path is intentionally NOT a normal queued command: main.py
 sets `worker.estop_event` directly, and the loop checks it first,
 every single iteration, before doing anything else -- so a panic
 click is never stuck behind a backlog of other commands.
+
+TICK RATE / LAG FIX
+---------------------------------------------------------------------------
+gim_motor.py no longer blocks this thread on a CAN round-trip (see
+can_link.py) -- sending a position command and reading back the latest
+angle are both now just in-memory cache operations. That's what lets the
+ramp tick run at CMD_HZ (50Hz, matching diff_wrist.py's control loop)
+instead of the old 20Hz, and lets status polling run far more often than
+the old poll_interval_s allowed without adding any real bus load, which
+is the direct fix for "the browser sliders don't track in real time."
+
+FOLLOW-ERROR / STALENESS SAFETY CHECK
+---------------------------------------------------------------------------
+Ported from diff_wrist.py's WristController._check_safety(): while a
+joint's torque is on, compare what we just commanded against its last
+known actual angle. If they diverge by more than follow_err_trip_deg for
+longer than follow_err_trip_hold_s, something is physically wrong (stall,
+jam, slipping load) even though the motor itself hasn't reported a fault
+code -- so disable that joint's torque and log it clearly. The old arm
+backend had no equivalent; a stalled joint would just keep commanding a
+position it could never reach.
 """
 
 import queue
@@ -27,6 +48,9 @@ from gim_motor import GimTimeout
 from motion import RampedJoint
 from logs import log_event
 
+FOLLOW_ERR_TRIP_DEG = 10.0
+FOLLOW_ERR_TRIP_HOLD_S = 0.3
+
 
 class Worker(threading.Thread):
     def __init__(self, arm: ArmController, cmd_q: "queue.Queue", status_q: "queue.Queue"):
@@ -38,6 +62,9 @@ class Worker(threading.Thread):
         self.estop_event = threading.Event()
         self.ramps: dict[str, RampedJoint] = {}
         self.jog_active: dict[str, int] = {}  # name -> direction (-1, 0, 1) while a jog key is held
+        self.follow_err_since: dict[str, float | None] = {}  # name -> monotonic time trip started
+        self._scan_lock = threading.Lock()
+        self._scan_running = False
 
     def stop(self):
         self._stop.set()
@@ -51,10 +78,13 @@ class Worker(threading.Thread):
             self.status_q.put({"type": "connect_error", "error": str(e)})
             return
 
-        poll_interval = self.arm.config.get("poll_interval_s", 0.4)
+        poll_interval = self.arm.config.get("poll_interval_s", 0.08)
         scan_interval = self.arm.config.get("scan_interval_s", 2.0)
         bus_watchdog_s = self.arm.config.get("bus_watchdog_s", 3.0)
-        tick_dt = 0.05
+        # 50Hz -- matches diff_wrist.py's CMD_HZ. Safe now that go_to_angle()
+        # never blocks on the bus (see can_link.py); at the old 20Hz every
+        # jog/slider move visibly stair-stepped instead of gliding.
+        tick_dt = 0.02
         last_poll = 0.0
         last_scan = 0.0
         last_tick = time.monotonic()
@@ -134,15 +164,41 @@ class Worker(threading.Thread):
                         last_any_connected = time.monotonic()  # don't re-trigger every cycle
 
                 if time.time() - last_scan >= scan_interval:
-                    discovered = self.arm.scan_broadcast(window_s=0.3)
-                    self.status_q.put({"type": "discovered", "devices": discovered})
                     last_scan = time.time()
+                    self._start_scan(window_s=0.3)
 
             except Exception as e:
                 self.status_q.put({"type": "info", "text": f"worker loop error: {e}"})
                 log_event("error", f"worker loop error: {e}")
 
             time.sleep(0.005)
+
+    # ---- discovery scan (off the ramp-tick thread) ------------------------
+    def _start_scan(self, window_s: float):
+        # scan_broadcast() sleeps for window_s while it listens for
+        # replies -- it used to do that inline in this loop, freezing
+        # every joint's ramp for 300ms every scan_interval. Now that
+        # ArmController.scan_broadcast() only touches the thread-safe
+        # CanLink cache (never a raw bus.recv()), it's safe to run it on
+        # its own short-lived thread instead, so discovery never stalls
+        # motion. A lock just prevents two scans overlapping if the
+        # previous one is still running.
+        with self._scan_lock:
+            if self._scan_running:
+                return
+            self._scan_running = True
+
+        def _run():
+            try:
+                discovered = self.arm.scan_broadcast(window_s=window_s)
+                self.status_q.put({"type": "discovered", "devices": discovered})
+            except Exception as e:
+                log_event("error", f"scan error: {e}")
+            finally:
+                with self._scan_lock:
+                    self._scan_running = False
+
+        threading.Thread(target=_run, daemon=True, name="arm-scan").start()
 
     def _rebuild_ramps(self):
         # Joint.set_angle() works in output-shaft degrees already (per
@@ -163,6 +219,7 @@ class Worker(threading.Thread):
         for r in self.ramps.values():
             r.stop_in_place()
         self.jog_active = {}
+        self.follow_err_since = {}
         self.status_q.put({"type": "estop_ack"})
         self.estop_event.clear()
 
@@ -190,6 +247,39 @@ class Worker(threading.Thread):
             except (GimTimeout, can.CanError) as e:
                 self.status_q.put({"type": "info", "text": f"[{name}] ramp send failed: {e}"})
 
+        self._check_follow_errors(time.monotonic())
+
+    # ---- follow-error safety check (ported from diff_wrist.py) ------------
+    def _check_follow_errors(self, now: float):
+        for name in list(self.arm.enabled):
+            ramp = self.ramps.get(name)
+            if ramp is None or ramp.commanded is None:
+                continue
+            try:
+                actual = self.arm.joints[name].get_angle()
+            except (GimTimeout, can.CanError):
+                continue  # staleness is handled by the connected/bus-watchdog path already
+            err = abs(ramp.commanded - actual)
+            if err > FOLLOW_ERR_TRIP_DEG:
+                since = self.follow_err_since.get(name)
+                if since is None:
+                    self.follow_err_since[name] = now
+                elif now - since > FOLLOW_ERR_TRIP_HOLD_S:
+                    self.arm.disable(name)
+                    ramp.stop_in_place()
+                    self.jog_active[name] = 0
+                    self.follow_err_since[name] = None
+                    log_event("error", f"{name}: FOLLOW-ERROR TRIP -- commanded "
+                                        f"{ramp.commanded:+.2f} deg vs actual {actual:+.2f} deg "
+                                        f"(>{FOLLOW_ERR_TRIP_DEG:.1f} deg for "
+                                        f">{FOLLOW_ERR_TRIP_HOLD_S:.2f}s) -- torque disabled. "
+                                        f"Check for a jam/stall before re-enabling.", joint=name)
+                    self.status_q.put({"type": "info", "text":
+                                        f"[{name}] follow-error trip -- torque disabled, "
+                                        f"check for a jam before re-enabling"})
+            else:
+                self.follow_err_since[name] = None
+
     # ---- commands from the browser ----------------------------------------
     def _handle_command(self, cmd):
         name = cmd.get("joint")
@@ -199,11 +289,13 @@ class Worker(threading.Thread):
                 self.arm.enable(name)
                 if name in self.ramps:
                     self.ramps[name].seed(self.arm.joints[name].get_angle())
+                self.follow_err_since[name] = None
             elif t == "disable":
                 self.arm.disable(name)
                 if name in self.ramps:
                     self.ramps[name].stop_in_place()
                 self.jog_active[name] = 0
+                self.follow_err_since[name] = None
             elif t == "enable_batch":
                 for n in cmd["joints"]:
                     self.arm.enable(n)
@@ -284,6 +376,20 @@ class Worker(threading.Thread):
                     self.jog_active[name] = cmd["direction"]
             elif t == "jog_stop":
                 self.jog_active[name] = 0
+            elif t == "jog_nudge":
+                # Discrete, exact-size step -- the customizable jog the
+                # frontend's step selector drives (see JOG_STEPS in
+                # app.js, ported from diff_wrist.py's JOG_STEPS_DEG /
+                # bracket-key step cycling). One tap = one step, instead
+                # of only a variable-duration hold at a fixed velocity.
+                if name not in self.arm.enabled:
+                    self.status_q.put({"type": "info", "text": f"[{name}] ignored jog: torque is OFF (enable first)"})
+                elif name in self.ramps:
+                    clamped, was_clamped = self.ramps[name].nudge_target(cmd["direction"] * cmd["step_deg"])
+                    self.status_q.put({"type": "info", "text":
+                                        f"[{name}] jog step {cmd['direction'] * cmd['step_deg']:+.3f} deg "
+                                        f"-> target {clamped:.2f} deg" +
+                                        (" (clamped to limit)" if was_clamped else "")})
             elif t == "set_position_gains":
                 self.arm.set_position_gains(name, cmd["kp"], cmd["ki"])
             elif t == "set_velocity_gains":

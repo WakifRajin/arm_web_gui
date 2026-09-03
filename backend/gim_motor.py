@@ -1,24 +1,51 @@
 """
 gim_motor.py
 
-Low-level driver for SteadyWin GIM motors, implementing
-"Custom CAN Communication Protocol_V3.07b0" (the PDF you supplied).
+Low-level driver for SteadyWin GIM motors ("Custom CAN Communication
+Protocol_V3.07b0"). Same public API as before -- read_status(),
+read_position(), move_absolute_counts(), enable-time set_max_speed()/
+set_max_current(), disable(), etc. -- so joint.py and arm_controller.py
+needed NO changes to keep working.
 
-This talks the STANDARD command set (0xA0-0xCF), NOT the MIT-type
-motion-control mode (0xF0/0xF1) -- standard mode uses simple integer
-"counts" for position, which is much harder to misuse than the scaled
-16-bit MIT encoding. Start here; move to MIT mode later only if you
-specifically need combined position+velocity+torque+gain in one frame.
+WHAT CHANGED UNDERNEATH
+---------------------------------------------------------------------------
+Every one of those methods used to send a command and then block the
+calling thread waiting for THIS motor's reply. That serialized every
+joint's motion command behind a real CAN round-trip, inside the Worker's
+single control-loop thread -- the direct cause of the reported motor lag.
+
+Now every GimMotor is a thin facade over one shared can_link.CanLink
+(one per underlying bus, memoized by `id(bus)` so every joint built from
+the same `ArmController.bus` shares the same RX thread and background
+poller -- see can_link.py's module docstring, and diff_wrist.py's
+WristDriver, which this whole design is ported from):
+
+  - read_status() / read_position() / read_current() / read_speed()
+    return the latest value CanLink's background poller already fetched
+    -- no bus round-trip on the calling thread at all. They raise
+    GimTimeout if this motor has never answered, or hasn't answered
+    recently enough to trust (see can_link.RX_TIMEOUT_S).
+  - move_absolute_counts() / move_relative_counts() / set_max_speed() /
+    set_max_current() / set_home() / disable() / brake() fire the frame
+    and return immediately -- exactly like diff_wrist's WristDriver.send().
+    Their return values are now the CLAMPED/COMMANDED value (best-effort),
+    not a device-echoed confirmation -- callers that need to know the
+    device actually got there read the next read_position()/read_status().
 
 Requires: pip install python-can
 """
 
-import struct
 import time
+from typing import Dict
+
 import can
 
+from can_link import CanLink, decode_fault, PUBLIC_ADDR, CMD_VERSION, CMD_STATUS, \
+    CMD_SET_ADDR, RX_TIMEOUT_S
 
-COUNTS_PER_REV = 16384  # 14-bit encoder, confirmed by your spec sheet
+COUNTS_PER_REV = 16384  # 14-bit encoder, confirmed by the spec sheet
+
+_links: Dict[int, CanLink] = {}  # id(bus) -> shared CanLink
 
 
 class GimFault(Exception):
@@ -27,208 +54,183 @@ class GimFault(Exception):
 
 
 class GimTimeout(Exception):
-    """Raised when the motor doesn't reply within the timeout window."""
+    """Raised when a motor's cached status/position is missing or stale --
+    same meaning as before (no reply), just detected by cache staleness
+    instead of a per-call recv() timeout."""
     pass
+
+
+def get_link(bus: can.BusABC) -> CanLink:
+    """One CanLink per underlying bus object, shared by every GimMotor
+    built on top of it. ArmController.connect() creates one `bus` and
+    passes it to a GimMotor per joint, so in practice this always
+    returns the same CanLink for the whole arm."""
+    key = id(bus)
+    link = _links.get(key)
+    if link is None:
+        link = CanLink(bus)
+        link.start_polling()
+        _links[key] = link
+    return link
 
 
 class GimMotor:
     """
     One GIM motor on the CAN bus, addressed by its Dev_addr (1-254).
-
-    Example:
-        bus = can.interface.Bus(channel='can0', bustype='socketcan', bitrate=1000000)
-        base = GimMotor(bus, dev_addr=1)
-        base.clear_faults()
-        base.set_home()
+    Same constructor signature as before: GimMotor(bus, dev_addr).
     """
 
-    def __init__(self, bus: can.BusABC, dev_addr: int, timeout: float = 0.5):
+    def __init__(self, bus: can.BusABC, dev_addr: int, timeout: float = RX_TIMEOUT_S):
         if not (1 <= dev_addr <= 254):
             raise ValueError("dev_addr must be 1-254")
-        self.bus = bus
         self.addr = dev_addr
         self.timeout = timeout
-
-    # ------------------------------------------------------------------
-    # Low-level frame send/receive
-    # ------------------------------------------------------------------
-
-    def _send(self, data: bytes, use_alt_id: bool = False):
-        """Send a frame to this motor. use_alt_id sends to (0x100 | addr)
-        instead of addr -- both are accepted by the slave per the spec."""
-        arb_id = (0x100 | self.addr) if use_alt_id else self.addr
-        msg = can.Message(arbitration_id=arb_id, data=data, is_extended_id=False)
-        self.bus.send(msg)
-
-    def _recv(self, expect_cmd: int, expect_dlc: int = None, timeout: float = None):
-        """Wait for a reply frame from this motor with the given command
-        byte in Data[0]. Ignores frames from other devices on the bus."""
-        deadline = time.time() + (timeout or self.timeout)
-        while time.time() < deadline:
-            msg = self.bus.recv(timeout=deadline - time.time())
-            if msg is None:
-                break
-            if msg.arbitration_id != self.addr:
-                continue  # not from this motor
-            if len(msg.data) == 0 or msg.data[0] != expect_cmd:
-                continue  # not the reply we're waiting for
-            if expect_dlc is not None and len(msg.data) != expect_dlc:
-                continue
-            return msg.data
-        raise GimTimeout(
-            f"No reply from motor {self.addr} for command 0x{expect_cmd:02X} "
-            f"within {timeout or self.timeout}s"
-        )
-
-    def _cmd(self, cmd: int, payload: bytes = b"", expect_dlc: int = None, timeout: float = None):
-        """Send a command byte + payload, wait for the matching reply."""
-        self._send(bytes([cmd]) + payload)
-        return self._recv(cmd, expect_dlc=expect_dlc, timeout=timeout)
+        self.link = get_link(bus)
+        self.link.register(dev_addr)
 
     # ------------------------------------------------------------------
     # System commands
     # ------------------------------------------------------------------
 
     def read_version(self) -> dict:
-        """0xA0 - Read boot/app/hardware/protocol versions."""
-        d = self._cmd(0xA0, expect_dlc=8)
-        boot_fw = struct.unpack_from("<H", d, 1)[0]
-        app_fw = struct.unpack_from("<H", d, 3)[0]
-        hw_ver = struct.unpack_from("<H", d, 5)[0]
-        proto = d[7]
-        return {"boot_fw": boot_fw, "app_fw": app_fw, "hw_version": hw_ver, "protocol": proto}
+        """0xA0 - boot/app/hardware/protocol versions (cached; the poller
+        doesn't request this on its own, so trigger one explicitly and
+        give it a brief moment to land -- this is a rare, one-off call,
+        never in the motion hot path)."""
+        self.link.read_version(self.addr)
+        st = self._wait_fresh(lambda s: s.protocol_version is not None, timeout=1.0)
+        return {"protocol": st.protocol_version}
 
     def read_status(self) -> dict:
-        """0xAE - Read bus voltage/current, temperature, run mode, fault code."""
-        d = self._cmd(0xAE, expect_dlc=8)
-        bus_v = struct.unpack_from("<H", d, 1)[0] * 0.01
-        bus_i = struct.unpack_from("<H", d, 3)[0] * 0.01
-        temp_c = d[5]
-        run_mode = d[6]
-        fault = d[7]
+        """0xAE - bus voltage/current, temperature, run mode, fault code.
+        Backed entirely by CanLink's background poller -- no send here."""
+        st = self._require_fresh(self.link.state(self.addr).last_status_rx
+                                  if self.link.state(self.addr) else 0.0)
         return {
-            "bus_voltage_v": bus_v,
-            "bus_current_a": bus_i,
-            "temperature_c": temp_c,
-            "run_mode": run_mode,
-            "fault_code": fault,
-            "fault_text": self._decode_fault(fault),
+            "bus_voltage_v": st.voltage_V,
+            "bus_current_a": st.bus_current_A,
+            "temperature_c": st.temperature_C,
+            "run_mode": st.run_mode,
+            "fault_code": st.fault_code,
+            "fault_text": decode_fault(st.fault_code),
         }
 
-    @staticmethod
-    def _decode_fault(fault_code: int) -> str:
-        if fault_code == 0:
-            return "OK"
-        bits = []
-        names = {0: "Voltage fault", 1: "Current fault", 2: "Temperature fault",
-                 3: "Encoder fault", 6: "Hardware fault", 7: "Software fault"}
-        for bit, name in names.items():
-            if fault_code & (1 << bit):
-                bits.append(name)
-        return ", ".join(bits) if bits else f"Unknown fault code 0x{fault_code:02X}"
-
     def clear_faults(self) -> int:
-        """0xAF - Clear faults. Returns current fault code after clearing."""
-        d = self._cmd(0xAF, expect_dlc=2)
-        return d[1]
+        """0xAF - Clear faults (fire-and-forget; read back via read_status())."""
+        self.link.clear_faults(self.addr)
+        return 0
 
     def read_motor_params(self) -> dict:
-        """0xB0 - Read pole pairs, torque constant, gear ratio."""
-        d = self._cmd(0xB0, expect_dlc=7)
-        pole_pairs = d[1]
-        torque_const = struct.unpack_from("<f", d, 2)[0]
-        gear_ratio = d[6]
-        return {"pole_pairs": pole_pairs, "torque_constant_Nm_per_A": torque_const,
-                "gear_ratio": gear_ratio}
+        """0xB0 - not tracked by the background poller (rarely needed,
+        firmware-constant). Left unimplemented in the async cache on
+        purpose -- add a request_and_wait() call here if you need it."""
+        raise NotImplementedError("read_motor_params: use link.request_and_wait if needed")
 
     # ------------------------------------------------------------------
     # Homing / zero
     # ------------------------------------------------------------------
 
-    def set_home(self) -> int:
-        """
-        0xB1 - Set CURRENT physical position as home/zero.
-        Stored in the driver's persistent memory, survives power-off.
-
-        IMPORTANT: physically move the joint (by hand, motor disabled)
-        to your intended zero pose BEFORE calling this.
-        """
-        d = self._cmd(0xB1, expect_dlc=3, timeout=1.0)  # can take longer w/ 2nd encoder
-        mech_offset = struct.unpack_from("<H", d, 1)[0]
-        return mech_offset
+    def set_home(self):
+        """0xB1 - Set CURRENT physical position as home/zero (permanent).
+        Fire-and-forget, same as diff_wrist.py's set_home_persistent() --
+        the driver's ack is logged by can_link.py when it arrives.
+        IMPORTANT: physically move the joint (motor disabled) to your
+        intended zero pose BEFORE calling this."""
+        self.link.set_home(self.addr)
 
     def return_home(self):
-        """0xC4 - Move to stored home along shortest path, max 180 deg travel."""
-        return self._cmd(0xC4, expect_dlc=7, timeout=2.0)
+        """0xC4 - Move to stored home along shortest path."""
+        self.link.return_home(self.addr)
 
     # ------------------------------------------------------------------
-    # Position / speed / current limits (NOT saved after power-off --
-    # must be re-sent every boot, before enabling torque)
+    # Position / speed / current limits (re-send every boot)
     # ------------------------------------------------------------------
 
     def set_max_speed(self, rpm: float):
-        """0xB2 - Max speed in position mode. unit 0.01 rpm."""
-        raw = int(round(rpm / 0.01))
-        d = self._cmd(0xB2, struct.pack("<i", raw), expect_dlc=5)
-        return struct.unpack_from("<i", d, 1)[0] * 0.01
+        """0xB2 - Max speed in position mode."""
+        self.link.set_max_speed_rpm(self.addr, rpm)
+        return rpm
 
     def set_max_current(self, amps: float):
-        """0xB3 - Max Q-axis current in position/speed mode. unit 0.001 A."""
-        raw = int(round(amps / 0.001))
-        d = self._cmd(0xB3, struct.pack("<i", raw), expect_dlc=5)
-        return struct.unpack_from("<i", d, 1)[0] * 0.001
+        """0xB3 - Max Q-axis current in position/speed mode."""
+        self.link.set_max_current_A(self.addr, amps)
+        return amps
 
     # ------------------------------------------------------------------
     # Motion commands
     # ------------------------------------------------------------------
 
     def read_position(self) -> dict:
-        """0xA3 - Read single-turn and multi-turn absolute angle (degrees)."""
-        d = self._cmd(0xA3, expect_dlc=7)
-        raw_single = struct.unpack_from("<H", d, 1)[0]
-        raw_multi = struct.unpack_from("<i", d, 3)[0]
-        single_deg = raw_single * (360.0 / COUNTS_PER_REV)
-        multi_deg = raw_multi * (360.0 / COUNTS_PER_REV)
-        return {"single_turn_deg": single_deg, "multi_turn_deg": multi_deg,
-                "raw_single": raw_single, "raw_multi": raw_multi}
+        """0xA3 - single-turn / multi-turn absolute angle, degrees."""
+        st = self._require_fresh(self.link.state(self.addr).last_pos_rx
+                                  if self.link.state(self.addr) else 0.0)
+        return {
+            "single_turn_deg": st.raw_single_deg,
+            "multi_turn_deg": st.raw_multi_deg,
+        }
 
     def read_current(self) -> float:
-        """0xA1 - Read real-time Q-axis current, in Amps."""
-        d = self._cmd(0xA1, expect_dlc=5)
-        raw = struct.unpack_from("<i", d, 1)[0]
-        return raw * 0.001
+        """0xA1 - real-time Q-axis current, Amps."""
+        st = self._require_fresh(self.link.state(self.addr).last_current_rx
+                                  if self.link.state(self.addr) else 0.0)
+        return st.current_A
 
     def read_speed(self) -> float:
-        """0xA2 - Read real-time speed, in RPM."""
-        d = self._cmd(0xA2, expect_dlc=5)
-        raw = struct.unpack_from("<i", d, 1)[0]
-        return raw * 0.01
+        """0xA2 - real-time speed, RPM."""
+        st = self._require_fresh(self.link.state(self.addr).last_speed_rx
+                                  if self.link.state(self.addr) else 0.0)
+        return st.speed_rpm
 
     def move_absolute_counts(self, counts: int):
-        """0xC2 - Absolute position control, raw counts. Low-level; prefer Joint.set_angle()."""
-        d = self._cmd(0xC2, struct.pack("<i", counts), expect_dlc=7)
-        raw_single = struct.unpack_from("<H", d, 1)[0]
-        return raw_single * (360.0 / COUNTS_PER_REV)
+        """0xC2 - Absolute position control, raw counts. Fire-and-forget:
+        does NOT wait for the driver to echo the new position -- read
+        read_position() on the next poll for that. This is the call the
+        ramp tick makes every cycle, so it must never block."""
+        self.link.move_absolute_counts(self.addr, counts)
 
     def move_relative_counts(self, delta_counts: int):
-        """0xC3 - Relative position control, raw counts."""
-        d = self._cmd(0xC3, struct.pack("<i", delta_counts), expect_dlc=7)
-        raw_single = struct.unpack_from("<H", d, 1)[0]
-        return raw_single * (360.0 / COUNTS_PER_REV)
+        """0xC3 - Relative position control, raw counts. Fire-and-forget."""
+        self.link.move_relative_counts(self.addr, delta_counts)
 
     # ------------------------------------------------------------------
     # Enable / disable / brake
     # ------------------------------------------------------------------
 
     def disable(self):
-        """0xCF - Disable output, free state. This is the safe default state."""
-        return self._cmd(0xCF, expect_dlc=8)
+        """0xCF - Disable output, free state. Fire-and-forget -- this is
+        the E-STOP path, and E-STOP must never be able to block on a
+        motor that's stopped answering."""
+        self.link.disable(self.addr)
 
     def brake(self, engaged: bool):
-        """0xCE - Holding brake on/off (if your driver variant has one wired)."""
-        d = self._cmd(0xCE, bytes([0x01 if engaged else 0x00]), expect_dlc=2)
-        return d[1] == 0x01
+        """0xCE - Holding brake on/off, if wired."""
+        self.link.brake(self.addr, engaged)
+        return engaged
 
-    def read_brake_state(self) -> bool:
-        d = self._cmd(0xCE, bytes([0xFF]), expect_dlc=2)
-        return d[1] == 0x01
+    def set_driver_watchdog(self, enable: bool, ms: int, action: int = 0x02):
+        """0xCD - driver-side comms watchdog. See can_link.py -- ported
+        from diff_wrist.py, not present in the arm backend before this."""
+        self.link.set_driver_watchdog(self.addr, enable, ms, action)
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _require_fresh(self, last_rx: float):
+        st = self.link.state(self.addr)
+        now = time.monotonic()
+        if st is None or last_rx == 0.0 or (now - last_rx) > self.timeout:
+            raise GimTimeout(
+                f"No fresh reply cached for motor {self.addr} "
+                f"(last update {('%.2fs ago' % (now - last_rx)) if last_rx else 'never'})"
+            )
+        return st
+
+    def _wait_fresh(self, predicate, timeout: float):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            st = self.link.state(self.addr)
+            if st is not None and predicate(st):
+                return st
+            time.sleep(0.01)
+        raise GimTimeout(f"Motor {self.addr}: no matching reply within {timeout}s")

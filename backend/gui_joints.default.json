@@ -1,5 +1,5 @@
 {
-  "poll_interval_s": 0.4,
+  "poll_interval_s": 0.08,
   "scan_interval_s": 2.0,
   "max_current_a": 3.0,
   "can_interface": "can0",
