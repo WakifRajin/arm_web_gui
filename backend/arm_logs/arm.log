@@ -1,3 +1,5 @@
 2026-09-04 01:15:43,775 [INFO] Backend started.
 2026-09-04 01:16:15,013 [ERROR] CAN up failed: Cannot find device "can0"
 2026-09-04 01:16:16,966 [ERROR] CAN up failed: Cannot find device "can0"
+2026-09-04 14:12:11,167 [INFO] Backend started.
+2026-09-04 14:45:22,979 [INFO] Backend started.
